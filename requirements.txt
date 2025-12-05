@@ -4,3 +4,4 @@ pytesseract==0.3.10
 pdf2image==1.17.0
 Pillow==10.2.0
 python-dateutil==2.9.0
+python-multipart==0.0.9
