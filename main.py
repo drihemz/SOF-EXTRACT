@@ -2,7 +2,7 @@ import io
 import re
 import tempfile
 from datetime import datetime
-from typing import List
+from typing import List, Dict, Tuple
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
@@ -15,12 +15,64 @@ app = FastAPI()
 TIME_REGEX = re.compile(r"(\d{1,2}[:\.]\d{2})")
 DATE_REGEX = re.compile(r"(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})")
 
+def parse_line_groups(ocr: Dict) -> List[Dict]:
+    """
+    Group Tesseract data by (block_num, par_num, line_num) and return lines with text + merged bbox.
+    """
+    grouped: Dict[Tuple[int, int, int], List[int]] = {}
+    n = len(ocr["text"])
+    for i in range(n):
+        text = ocr["text"][i]
+        if not text or text.strip() == "":
+            continue
+        key = (ocr["block_num"][i], ocr["par_num"][i], ocr["line_num"][i])
+        grouped.setdefault(key, []).append(i)
+
+    lines = []
+    for (b, p, l), idxs in grouped.items():
+        idxs = sorted(idxs)
+        words = []
+        x1 = y1 = 10**9
+        x2 = y2 = -10**9
+        confs = []
+        for i in idxs:
+            words.append(ocr["text"][i])
+            x, y, w, h = ocr["left"][i], ocr["top"][i], ocr["width"][i], ocr["height"][i]
+            x1 = min(x1, x)
+            y1 = min(y1, y)
+            x2 = max(x2, x + w)
+            y2 = max(y2, y + h)
+            try:
+                c = float(ocr["conf"][i])
+                if c >= 0:
+                    confs.append(c)
+            except Exception:
+                pass
+        text = " ".join(words).strip()
+        if not text:
+            continue
+        bbox = {"x": x1, "y": y1, "width": x2 - x1, "height": y2 - y1}
+        avg_conf = sum(confs) / len(confs) if confs else None
+        lines.append(
+            {
+                "text": text,
+                "bbox": bbox,
+                "confidence": avg_conf / 100 if avg_conf is not None else None,
+                "block": b,
+                "paragraph": p,
+                "line": l,
+            }
+        )
+    return lines
+
 def ocr_images(images: List[Image.Image]):
     events = []
+    boxes = []  # raw line boxes for overlay
     for page_idx, img in enumerate(images, start=1):
-        text = pytesseract.image_to_string(img)
-        for line_idx, line in enumerate(text.splitlines(), start=1):
-            clean = line.strip()
+        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+        lines = parse_line_groups(data)
+        for line_idx, line in enumerate(lines, start=1):
+            clean = line["text"].strip()
             if not clean:
                 continue
             times = TIME_REGEX.findall(clean)
@@ -31,18 +83,30 @@ def ocr_images(images: List[Image.Image]):
             if len(times) >= 2:
                 end = times[1].replace(".", ":")
             event_name = clean
-            events.append({
-                "event": event_name,
-                "start": start,
-                "end": end,
-                "ratePercent": None,
-                "behavior": None,
-                "notes": clean,
-                "page": page_idx,
-                "line": line_idx,
-                "confidence": None,
-            })
-    return events
+            events.append(
+                {
+                    "event": event_name,
+                    "start": start,
+                    "end": end,
+                    "ratePercent": None,
+                    "behavior": None,
+                    "notes": clean,
+                    "page": page_idx,
+                    "line": line_idx,
+                    "confidence": line["confidence"],
+                    "bbox": line["bbox"],
+                }
+            )
+            boxes.append(
+                {
+                    "page": page_idx,
+                    "line": line_idx,
+                    "text": clean,
+                    "bbox": line["bbox"],
+                    "confidence": line["confidence"],
+                }
+            )
+    return events, boxes
 
 @app.post("/extract")
 async def extract(file: UploadFile = File(...)):
@@ -57,9 +121,12 @@ async def extract(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to load file: {e}") from e
 
-    events = ocr_images(images)
-    return JSONResponse({
-        "events": events,
-        "warnings": [],
-        "meta": {"sourcePages": len(images), "durationMs": None}
-    })
+    events, boxes = ocr_images(images)
+    return JSONResponse(
+        {
+          "events": events,
+          "boxes": boxes,  # raw line boxes to draw overlays
+          "warnings": [],
+          "meta": {"sourcePages": len(images), "durationMs": None},
+        }
+    )
