@@ -1,24 +1,29 @@
 import io
 import re
-import tempfile
-from datetime import datetime
 from typing import List, Dict, Tuple
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pdf2image import convert_from_bytes
 from PIL import Image
 import pytesseract
 
 app = FastAPI()
 
+# CORS: adjust origins to your app domains
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # or ["http://localhost:3000", "https://your-domain.com"]
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 TIME_REGEX = re.compile(r"(\d{1,2}[:\.]\d{2})")
 DATE_REGEX = re.compile(r"(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})")
 
 def parse_line_groups(ocr: Dict) -> List[Dict]:
-    """
-    Group Tesseract data by (block_num, par_num, line_num) and return lines with text + merged bbox.
-    """
     grouped: Dict[Tuple[int, int, int], List[int]] = {}
     n = len(ocr["text"])
     for i in range(n):
@@ -57,7 +62,7 @@ def parse_line_groups(ocr: Dict) -> List[Dict]:
             {
                 "text": text,
                 "bbox": bbox,
-                "confidence": avg_conf / 100 if avg_conf is not None else None,
+                "confidence": (avg_conf / 100) if avg_conf is not None else None,
                 "block": b,
                 "paragraph": p,
                 "line": l,
@@ -67,9 +72,10 @@ def parse_line_groups(ocr: Dict) -> List[Dict]:
 
 def ocr_images(images: List[Image.Image]):
     events = []
-    boxes = []  # raw line boxes for overlay
+    boxes = []
     for page_idx, img in enumerate(images, start=1):
-        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+        # Better OCR defaults: OEM 1 (LSTM), PSM 6 (block of text)
+        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT, config="--oem 1 --psm 6", lang="eng")
         lines = parse_line_groups(data)
         for line_idx, line in enumerate(lines, start=1):
             clean = line["text"].strip()
@@ -82,10 +88,9 @@ def ocr_images(images: List[Image.Image]):
                 start = times[0].replace(".", ":")
             if len(times) >= 2:
                 end = times[1].replace(".", ":")
-            event_name = clean
             events.append(
                 {
-                    "event": event_name,
+                    "event": clean,
                     "start": start,
                     "end": end,
                     "ratePercent": None,
@@ -115,7 +120,8 @@ async def extract(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Empty file")
     try:
         if file.filename.lower().endswith(".pdf"):
-            images = convert_from_bytes(content, fmt="png")
+            # Higher DPI for better OCR layout
+            images = convert_from_bytes(content, fmt="png", dpi=250)
         else:
             images = [Image.open(io.BytesIO(content))]
     except Exception as e:
@@ -124,9 +130,9 @@ async def extract(file: UploadFile = File(...)):
     events, boxes = ocr_images(images)
     return JSONResponse(
         {
-          "events": events,
-          "boxes": boxes,  # raw line boxes to draw overlays
-          "warnings": [],
-          "meta": {"sourcePages": len(images), "durationMs": None},
+            "events": events,
+            "boxes": boxes,
+            "warnings": [],
+            "meta": {"sourcePages": len(images), "durationMs": None},
         }
     )
