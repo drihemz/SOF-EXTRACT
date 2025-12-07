@@ -128,8 +128,8 @@ async def extract(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Empty file")
     try:
         if file.filename.lower().endswith(".pdf"):
-            # Higher DPI for better OCR layout; bump to 300 if needed
-            images = convert_from_bytes(content, fmt="png", dpi=250)
+            # Higher DPI for better OCR layout
+            images = convert_from_bytes(content, fmt="png", dpi=300)
         else:
             images = [Image.open(io.BytesIO(content))]
     except Exception as e:
@@ -137,22 +137,24 @@ async def extract(file: UploadFile = File(...)):
 
     events, boxes = ocr_images(images)
     if len(events) == 0:
-        # Fallback: plain text extraction to avoid empty responses
-        try:
-            text = pytesseract.image_to_string(images[0], config="--oem 1 --psm 6", lang="eng")
-        except Exception:
-            text = ""
-        if text.strip():
-            events.append(
-                {
-                    "event": text.strip(),
-                    "notes": text.strip(),
-                    "page": 1,
-                    "line": 1,
-                    "confidence": None,
-                    "bbox": None,
-                }
-            )
+        # Fallback: plain text extraction per page to avoid empty responses
+        for page_idx, img in enumerate(images, start=1):
+            try:
+                text = pytesseract.image_to_string(img, config="--oem 1 --psm 6", lang="eng")
+            except Exception:
+                text = ""
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            for line_idx, line_text in enumerate(lines, start=1):
+                events.append(
+                    {
+                        "event": line_text,
+                        "notes": line_text,
+                        "page": page_idx,
+                        "line": line_idx,
+                        "confidence": None,
+                        "bbox": None,
+                    }
+                )
 
     return JSONResponse(
         {
