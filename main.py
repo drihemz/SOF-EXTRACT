@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from pdf2image import convert_from_bytes
 from PIL import Image
 import pytesseract
+from PyPDF2 import PdfReader
 
 app = FastAPI()
 
@@ -22,6 +23,34 @@ app.add_middleware(
 
 TIME_REGEX = re.compile(r"(\d{1,2}[:\.]\d{2})")
 DATE_REGEX = re.compile(r"(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})")
+
+
+def extract_pdf_text_events(content: bytes) -> Tuple[List[Dict], int]:
+    """Fast path: try native text extraction before OCR for digital PDFs."""
+    try:
+        reader = PdfReader(io.BytesIO(content))
+    except Exception:
+        return [], 0
+
+    events: List[Dict] = []
+    for page_idx, page in enumerate(reader.pages, start=1):
+        try:
+            text = page.extract_text() or ""
+        except Exception:
+            text = ""
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        for line_idx, line in enumerate(lines, start=1):
+            events.append(
+                {
+                    "event": line,
+                    "notes": line,
+                    "page": page_idx,
+                    "line": line_idx,
+                    "confidence": 1.0,  # text extraction is reliable for digital PDFs
+                    "bbox": None,
+                }
+            )
+    return events, len(reader.pages)
 
 
 def parse_line_groups(ocr: Dict) -> List[Dict]:
@@ -126,8 +155,22 @@ async def extract(file: UploadFile = File(...)):
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="Empty file")
+
+    is_pdf = file.filename.lower().endswith(".pdf")
+    if is_pdf:
+        text_events, page_count = extract_pdf_text_events(content)
+        if len(text_events) > 0:
+            return JSONResponse(
+                {
+                    "events": text_events,
+                    "boxes": [],
+                    "warnings": [],
+                    "meta": {"sourcePages": page_count or None, "durationMs": None},
+                }
+            )
+
     try:
-        if file.filename.lower().endswith(".pdf"):
+        if is_pdf:
             # Higher DPI for better OCR layout
             images = convert_from_bytes(content, fmt="png", dpi=300)
         else:
