@@ -3,3 +3,4 @@ uvicorn[standard]
 pdf2image
 pillow
 pytesseract
+python-multipart
