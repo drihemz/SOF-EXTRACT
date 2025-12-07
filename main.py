@@ -11,10 +11,10 @@ import pytesseract
 
 app = FastAPI()
 
-# CORS: adjust origins to your app domains
+# CORS: tighten to your domains if needed
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # or ["http://localhost:3000", "https://your-domain.com"]
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -74,8 +74,13 @@ def ocr_images(images: List[Image.Image]):
     events = []
     boxes = []
     for page_idx, img in enumerate(images, start=1):
-        # Better OCR defaults: OEM 1 (LSTM), PSM 6 (block of text)
-        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT, config="--oem 1 --psm 6", lang="eng")
+        # Better OCR defaults
+        data = pytesseract.image_to_data(
+            img,
+            output_type=pytesseract.Output.DICT,
+            config="--oem 1 --psm 6",
+            lang="eng",
+        )
         lines = parse_line_groups(data)
         for line_idx, line in enumerate(lines, start=1):
             clean = line["text"].strip()
@@ -120,7 +125,7 @@ async def extract(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Empty file")
     try:
         if file.filename.lower().endswith(".pdf"):
-            # Higher DPI for better OCR layout
+            # Higher DPI for better OCR layout; bump to 300 if needed
             images = convert_from_bytes(content, fmt="png", dpi=250)
         else:
             images = [Image.open(io.BytesIO(content))]
