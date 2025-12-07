@@ -1,17 +1,17 @@
 import io
 import re
-from typing import List, Dict, Tuple
+from typing import Dict, List, Tuple
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pdf2image import convert_from_bytes
 from PIL import Image
 import pytesseract
 
 app = FastAPI()
 
-# CORS: tighten to your domains if needed
+# CORS: tighten origins to your frontend domains if needed
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,6 +22,7 @@ app.add_middleware(
 
 TIME_REGEX = re.compile(r"(\d{1,2}[:\.]\d{2})")
 DATE_REGEX = re.compile(r"(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})")
+
 
 def parse_line_groups(ocr: Dict) -> List[Dict]:
     grouped: Dict[Tuple[int, int, int], List[int]] = {}
@@ -70,11 +71,12 @@ def parse_line_groups(ocr: Dict) -> List[Dict]:
         )
     return lines
 
+
 def ocr_images(images: List[Image.Image]):
     events = []
     boxes = []
     for page_idx, img in enumerate(images, start=1):
-        # Better OCR defaults
+        # Better OCR defaults: OEM 1 (LSTM), PSM 6 (block of text)
         data = pytesseract.image_to_data(
             img,
             output_type=pytesseract.Output.DICT,
@@ -118,6 +120,7 @@ def ocr_images(images: List[Image.Image]):
             )
     return events, boxes
 
+
 @app.post("/extract")
 async def extract(file: UploadFile = File(...)):
     content = await file.read()
@@ -133,6 +136,24 @@ async def extract(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=f"Failed to load file: {e}") from e
 
     events, boxes = ocr_images(images)
+    if len(events) == 0:
+        # Fallback: plain text extraction to avoid empty responses
+        try:
+            text = pytesseract.image_to_string(images[0], config="--oem 1 --psm 6", lang="eng")
+        except Exception:
+            text = ""
+        if text.strip():
+            events.append(
+                {
+                    "event": text.strip(),
+                    "notes": text.strip(),
+                    "page": 1,
+                    "line": 1,
+                    "confidence": None,
+                    "bbox": None,
+                }
+            )
+
     return JSONResponse(
         {
             "events": events,
