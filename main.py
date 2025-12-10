@@ -108,17 +108,12 @@ def parse_line_groups(ocr: Dict) -> List[Dict]:
     return lines
 
 
-def ocr_images(images: List[Image.Image]):
+def ocr_images(images: List[Image.Image], config: str = "--oem 1 --psm 6"):
     events = []
     boxes = []
     for page_idx, img in enumerate(images, start=1):
-        # Better OCR defaults: OEM 1 (LSTM), PSM 6 (block of text)
-        data = pytesseract.image_to_data(
-            img,
-            output_type=pytesseract.Output.DICT,
-            config="--oem 1 --psm 6",
-            lang="eng",
-        )
+        # Better OCR defaults: OEM 1 (LSTM), configurable PSM
+        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT, config=config, lang="eng")
         lines = parse_line_groups(data)
         for line_idx, line in enumerate(lines, start=1):
             clean = line["text"].strip()
@@ -198,6 +193,22 @@ async def extract(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail=f"Failed to load file: {e}") from e
 
     events, boxes = ocr_images(images)
+
+    # If OCR returned almost nothing, retry at higher DPI and a different PSM suited for dense text.
+    if is_pdf and len(events) < 5:
+        try:
+            dpi_retry = max(DPI, 300)
+            images_retry = convert_from_bytes(
+                content,
+                fmt="png",
+                dpi=dpi_retry,
+                first_page=1,
+                last_page=MAX_PDF_PAGES if MAX_PDF_PAGES > 0 else None,
+            )
+            events, boxes = ocr_images(images_retry, config="--oem 1 --psm 4")
+        except Exception:
+            pass
+
     if len(events) == 0:
         # Fallback: plain text extraction per page to avoid empty responses
         for page_idx, img in enumerate(images, start=1):
