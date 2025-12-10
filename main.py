@@ -2,7 +2,7 @@ import io
 import os
 import re
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import fitz  # PyMuPDF
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -22,8 +22,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-TIME_REGEX = re.compile(r"(\d{1,2}[:\.]\d{2})")
-DATE_REGEX = re.compile(r"(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})")
+TIME_REGEX = re.compile(r"(\d{1,2}[:h\.]\d{2})", re.IGNORECASE)
+DATE_REGEX = re.compile(r"(\d{1,2}[\/\-\.]\d{1,2}[\/\-]\d{2,4})")
 
 # Tunables via env for performance safeguards
 # Set SOF_MAX_PDF_PAGES=0 (default) to process all pages. Set a positive number to cap for performance if desired.
@@ -38,6 +38,16 @@ BASE_TESS_CONFIG = os.environ.get("SOF_TESS_CONFIG", "--oem 1 --psm 6 -c preserv
 DENSE_TESS_CONFIG = os.environ.get("SOF_TESS_CONFIG_DENSE", "--oem 1 --psm 4 -c preserve_interword_spaces=1")
 
 
+def _normalize_times(times: List[str]) -> Tuple[Optional[str], Optional[str]]:
+    """Normalize time strings like 15h20 or 00.00 to HH:MM."""
+    start = end = None
+    if len(times) >= 1:
+        start = times[0].lower().replace("h", ":").replace(".", ":")
+    if len(times) >= 2:
+        end = times[1].lower().replace("h", ":").replace(".", ":")
+    return start, end
+
+
 def extract_text_layer_events(page: fitz.Page) -> List[Dict]:
     """Use the PDF text layer when present to avoid OCR cost and noise."""
     events: List[Dict] = []
@@ -48,6 +58,7 @@ def extract_text_layer_events(page: fitz.Page) -> List[Dict]:
         return events
 
     blocks = raw.get("blocks", [])
+    line_counter = 0
     for block in blocks:
         if block.get("type") != 0:  # text blocks only
             continue
@@ -56,14 +67,21 @@ def extract_text_layer_events(page: fitz.Page) -> List[Dict]:
             text = " ".join(span.get("text", "") for span in spans).strip()
             if not text:
                 continue
+            times = TIME_REGEX.findall(text)
+            dates = DATE_REGEX.findall(text)
+            start, end = _normalize_times(times)
             x1, y1, x2, y2 = line.get("bbox", (0, 0, 0, 0))
             bbox = {"x": x1, "y": y1, "width": x2 - x1, "height": y2 - y1}
+            line_counter += 1
             events.append(
                 {
                     "event": text,
                     "notes": text,
+                    "start": start,
+                    "end": end,
+                    "dates": list(dict.fromkeys(dates)),
                     "page": page.number + 1,
-                    "line": len(events) + 1,
+                    "line": line_counter,
                     "confidence": 0.99,
                     "bbox": bbox,
                 }
@@ -119,10 +137,11 @@ def parse_line_groups(ocr: Dict) -> List[Dict]:
     return lines
 
 
-def ocr_images(images: List[Image.Image], config: str = "--oem 1 --psm 6"):
+def ocr_images(images: List[Image.Image], config: str = "--oem 1 --psm 6", base_page_index: int = 1):
     events = []
     boxes = []
-    for page_idx, img in enumerate(images, start=1):
+    for offset, img in enumerate(images):
+        page_idx = base_page_index + offset
         # Better OCR defaults: OEM 1 (LSTM), configurable PSM
         data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT, config=config, lang="eng")
         lines = parse_line_groups(data)
@@ -132,16 +151,13 @@ def ocr_images(images: List[Image.Image], config: str = "--oem 1 --psm 6"):
                 continue
             times = TIME_REGEX.findall(clean)
             dates = DATE_REGEX.findall(clean)
-            start = end = None
-            if len(times) >= 1:
-                start = times[0].replace(".", ":")
-            if len(times) >= 2:
-                end = times[1].replace(".", ":")
+            start, end = _normalize_times(times)
             events.append(
                 {
                     "event": clean,
                     "start": start,
                     "end": end,
+                    "dates": list(dict.fromkeys(dates)),
                     "ratePercent": None,
                     "behavior": None,
                     "notes": clean,
@@ -211,6 +227,12 @@ def average_confidence(events: List[Dict]) -> float:
     return float(sum(vals) / len(vals))
 
 
+def mark_low_quality_events(events: List[Dict], threshold: float = 0.5):
+    for ev in events:
+        conf = ev.get("confidence")
+        ev["quality"] = "low" if conf is not None and conf < threshold else "ok"
+
+
 def ocr_pdf_in_batches(content: bytes, max_pages: int, tess_cfg: str, dense_cfg: str, time_budget: int):
     """Process PDF pages one by one with a time budget; keeps all pages unless budget is hit.
 
@@ -229,9 +251,10 @@ def ocr_pdf_in_batches(content: bytes, max_pages: int, tess_cfg: str, dense_cfg:
         doc = fitz.open(stream=content, filetype="pdf")
         total_pages = doc.page_count
     except Exception:
-        return [], [], ["Failed to open PDF for OCR"]
+        return [], [], ["Failed to open PDF for OCR"], 0
 
     limit = max_pages if max_pages > 0 else total_pages
+    limit = min(limit, total_pages)
     for page_idx in range(limit):
         elapsed = time.monotonic() - start_time
         if elapsed > time_budget:
@@ -254,6 +277,7 @@ def ocr_pdf_in_batches(content: bytes, max_pages: int, tess_cfg: str, dense_cfg:
             continue
 
         # Render page at base DPI
+        used_dpi = BASE_DPI
         img = render_page_to_pil(page, dpi=BASE_DPI)
         gray = preprocess_image(img)
 
@@ -266,34 +290,44 @@ def ocr_pdf_in_batches(content: bytes, max_pages: int, tess_cfg: str, dense_cfg:
         if edge_density(gray) > 0.08 and DENSE_DPI > BASE_DPI:
             img = render_page_to_pil(page, dpi=DENSE_DPI)
             gray = preprocess_image(img)
+            used_dpi = DENSE_DPI
 
         # Primary OCR
-        ev_batch, box_batch = ocr_images([gray], config=tess_cfg)
+        ev_batch, box_batch = ocr_images([gray], config=tess_cfg, base_page_index=page_idx + 1)
         conf_avg = average_confidence(ev_batch)
+        mark_low_quality_events(ev_batch, threshold=0.5)
 
         # Targeted re-run with denser PSM/DPI when the pass looks weak and we still have budget
         if (len(ev_batch) < 3 or conf_avg < 0.55) and (time.monotonic() - page_start) < PER_PAGE_SECONDS:
-            if DENSE_DPI > BASE_DPI:
+            if DENSE_DPI > used_dpi:
                 img = render_page_to_pil(page, dpi=DENSE_DPI)
                 gray = preprocess_image(img)
-            ev_retry, box_retry = ocr_images([gray], config=dense_cfg)
+                used_dpi = DENSE_DPI
+            ev_retry, box_retry = ocr_images([gray], config=dense_cfg, base_page_index=page_idx + 1)
+            mark_low_quality_events(ev_retry, threshold=0.5)
             if len(ev_retry) > len(ev_batch) or average_confidence(ev_retry) > conf_avg:
                 ev_batch, box_batch = ev_retry, box_retry
 
-        # Attach page index metadata
+        # Attach page index metadata (override any local indexing)
         for ev in ev_batch:
-            ev.setdefault("page", page_idx + 1)
+            ev["page"] = page_idx + 1
         for b in box_batch:
-            b.setdefault("page", page_idx + 1)
+            b["page"] = page_idx + 1
 
         events.extend(ev_batch)
         boxes.extend(box_batch)
+
+        if time.monotonic() - page_start > PER_PAGE_SECONDS:
+            warnings.append(
+                f"Page {page_idx + 1} processing reached per-page time budget ({PER_PAGE_SECONDS}s); no further retries attempted."
+            )
 
     return events, boxes, warnings, total_pages
 
 
 @app.post("/extract")
 async def extract(file: UploadFile = File(...)):
+    req_start = time.monotonic()
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="Empty file")
@@ -324,11 +358,18 @@ async def extract(file: UploadFile = File(...)):
         ocr_warnings = []
         page_count = len(images)
 
+    duration_ms = int((time.monotonic() - req_start) * 1000)
+
     return JSONResponse(
         {
             "events": events,
             "boxes": boxes,
             "warnings": ocr_warnings,
-            "meta": {"sourcePages": page_count, "durationMs": None},
+            "meta": {
+                "sourcePages": page_count,
+                "durationMs": duration_ms,
+                "maxSeconds": MAX_SECONDS,
+                "perPageSeconds": PER_PAGE_SECONDS,
+            },
         }
     )
