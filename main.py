@@ -1,4 +1,5 @@
 import io
+import os
 import re
 from typing import Dict, List, Tuple
 
@@ -23,6 +24,12 @@ app.add_middleware(
 
 TIME_REGEX = re.compile(r"(\d{1,2}[:\.]\d{2})")
 DATE_REGEX = re.compile(r"(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})")
+
+# Tunables via env for performance safeguards
+# Set SOF_MAX_PDF_PAGES=0 (default) to process all pages. Set a positive number to cap for performance if desired.
+MAX_PDF_PAGES = int(os.environ.get("SOF_MAX_PDF_PAGES", "0"))
+DPI = int(os.environ.get("SOF_OCR_DPI", "200"))  # lower DPI for speed unless overridden
+MAX_FILE_BYTES = int(os.environ.get("SOF_MAX_FILE_BYTES", str(40 * 1024 * 1024)))  # 40MB guard
 
 
 def extract_pdf_text_events(content: bytes) -> Tuple[List[Dict], int]:
@@ -169,10 +176,22 @@ async def extract(file: UploadFile = File(...)):
                 }
             )
 
+    if len(content) > MAX_FILE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large for OCR (>{MAX_FILE_BYTES // (1024*1024)} MB). Please trim pages or reduce size.",
+        )
+
     try:
         if is_pdf:
-            # Higher DPI for better OCR layout
-            images = convert_from_bytes(content, fmt="png", dpi=300)
+            # Convert pages (all by default; cap if env explicitly set)
+            images = convert_from_bytes(
+                content,
+                fmt="png",
+                dpi=DPI,
+                first_page=1,
+                last_page=MAX_PDF_PAGES if MAX_PDF_PAGES > 0 else None,
+            )
         else:
             images = [Image.open(io.BytesIO(content))]
     except Exception as e:
