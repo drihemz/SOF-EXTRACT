@@ -279,30 +279,24 @@ async def extract(file: UploadFile = File(...)):
             detail=f"File too large for OCR (>{MAX_FILE_BYTES // (1024*1024)} MB). Please trim pages or reduce size.",
         )
 
-    try:
-        if is_pdf:
-            # Convert pages (all by default; cap if env explicitly set)
-            images = convert_from_bytes(
-                content,
-                fmt="png",
-                dpi=DPI,
-                first_page=1,
-                last_page=MAX_PDF_PAGES if MAX_PDF_PAGES > 0 else None,
-            )
-        else:
+    # Branch: PDFs use batch OCR; images use single-pass OCR
+    if is_pdf:
+        events, boxes, ocr_warnings = ocr_pdf_in_batches(
+            content,
+            dpi=DPI,
+            max_pages=MAX_PDF_PAGES if MAX_PDF_PAGES > 0 else 0,
+            batch_pages=max(BATCH_PAGES, 1),
+            tess_cfg=BASE_TESS_CONFIG,
+            dense_cfg=DENSE_TESS_CONFIG,
+            time_budget=MAX_SECONDS,
+        )
+    else:
+        try:
             images = [Image.open(io.BytesIO(content))]
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to load file: {e}") from e
-
-    events, boxes, ocr_warnings = ocr_pdf_in_batches(
-        content,
-        dpi=DPI,
-        max_pages=MAX_PDF_PAGES if MAX_PDF_PAGES > 0 else 0,
-        batch_pages=max(BATCH_PAGES, 1),
-        tess_cfg=BASE_TESS_CONFIG,
-        dense_cfg=DENSE_TESS_CONFIG,
-        time_budget=MAX_SECONDS,
-    )
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to load file: {e}") from e
+        events, boxes = ocr_images(images)
+        ocr_warnings = []
 
     # Merge any sparse text-layer events we collected earlier
     if text_events_for_merge:
