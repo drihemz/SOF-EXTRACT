@@ -5,3 +5,4 @@ pillow
 pytesseract
 python-multipart
 PyPDF2
+PyMuPDF
