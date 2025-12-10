@@ -159,9 +159,10 @@ async def extract(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Empty file")
 
     is_pdf = file.filename.lower().endswith(".pdf")
+    text_events_for_merge: List[Dict] = []
     if is_pdf:
         text_events, page_count = extract_pdf_text_events(content)
-        if len(text_events) > 0:
+        if len(text_events) >= 5:
             return JSONResponse(
                 {
                     "events": text_events,
@@ -170,6 +171,8 @@ async def extract(file: UploadFile = File(...)):
                     "meta": {"sourcePages": page_count or None, "durationMs": None},
                 }
             )
+        # If text layer is too sparse, keep these lines and fall through to OCR to try to enrich
+        text_events_for_merge = text_events or []
 
     if len(content) > MAX_FILE_BYTES:
         raise HTTPException(
@@ -232,6 +235,10 @@ async def extract(file: UploadFile = File(...)):
         if len(fallback_events) > len(events):
             events = fallback_events
             boxes = []
+
+    # Merge any sparse text-layer events we collected earlier
+    if text_events_for_merge:
+        events = text_events_for_merge + events
 
     if len(events) == 0:
         # Fallback: plain text extraction per page to avoid empty responses
