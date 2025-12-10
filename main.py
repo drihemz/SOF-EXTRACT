@@ -10,6 +10,7 @@ from pdf2image import convert_from_bytes
 from PIL import Image
 import pytesseract
 from PyPDF2 import PdfReader
+import time
 
 app = FastAPI()
 
@@ -30,6 +31,10 @@ DATE_REGEX = re.compile(r"(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})")
 MAX_PDF_PAGES = int(os.environ.get("SOF_MAX_PDF_PAGES", "0"))
 DPI = int(os.environ.get("SOF_OCR_DPI", "200"))  # lower DPI for speed unless overridden
 MAX_FILE_BYTES = int(os.environ.get("SOF_MAX_FILE_BYTES", str(40 * 1024 * 1024)))  # 40MB guard
+MAX_SECONDS = int(os.environ.get("SOF_MAX_SECONDS", "280"))  # keep under 5 min proxy timeout
+BATCH_PAGES = int(os.environ.get("SOF_BATCH_PAGES", "3"))  # pages per OCR batch
+BASE_TESS_CONFIG = os.environ.get("SOF_TESS_CONFIG", "--oem 1 --psm 6 -c preserve_interword_spaces=1")
+DENSE_TESS_CONFIG = os.environ.get("SOF_TESS_CONFIG_DENSE", "--oem 1 --psm 4 -c preserve_interword_spaces=1")
 
 
 def extract_pdf_text_events(content: bytes) -> Tuple[List[Dict], int]:
@@ -152,6 +157,100 @@ def ocr_images(images: List[Image.Image], config: str = "--oem 1 --psm 6"):
     return events, boxes
 
 
+def ocr_pdf_in_batches(content: bytes, dpi: int, max_pages: int, batch_pages: int, tess_cfg: str, dense_cfg: str, time_budget: int):
+    """Process PDF pages in small batches to avoid long single calls and allow early exit."""
+    start_time = time.monotonic()
+    events: List[Dict] = []
+    boxes: List[Dict] = []
+    warnings: List[str] = []
+
+    try:
+        reader = PdfReader(io.BytesIO(content))
+        total_pages = len(reader.pages)
+    except Exception:
+        total_pages = None
+
+    page_num = 1
+    while True:
+        if max_pages > 0 and page_num > max_pages:
+            break
+        if time.monotonic() - start_time > time_budget:
+            warnings.append(f"OCR stopped early after reaching time budget ({time_budget}s).")
+            break
+
+        # Build a batch of pages
+        last_page = page_num + batch_pages - 1
+        if max_pages > 0:
+            last_page = min(last_page, max_pages)
+        try:
+            imgs = convert_from_bytes(
+                content,
+                fmt="png",
+                dpi=dpi,
+                first_page=page_num,
+                last_page=last_page,
+            )
+        except Exception:
+            break
+
+        # Optional: auto-rotate via OSD if needed
+        def maybe_upright(img: Image.Image) -> Image.Image:
+            try:
+                osd = pytesseract.image_to_osd(img, config="--psm 0")
+                m = re.search(r"Rotate: (\d+)", osd)
+                if m:
+                    rot = int(m.group(1)) % 360
+                    if rot:
+                        return img.rotate(-rot, expand=True)
+            except Exception:
+                pass
+            return img
+
+        imgs = [maybe_upright(im) for im in imgs]
+
+        ev_batch, box_batch = ocr_images(imgs, config=tess_cfg)
+        events.extend(ev_batch)
+        boxes.extend(box_batch)
+
+        page_num = last_page + 1
+        if total_pages and page_num > total_pages:
+            break
+
+    # If very little came back, run a dense pass across the same pages (respecting time budget)
+    if len(events) < 5 and (time.monotonic() - start_time) < time_budget:
+        page_num = 1
+        events = []
+        boxes = []
+        while True:
+            if max_pages > 0 and page_num > max_pages:
+                break
+            if time.monotonic() - start_time > time_budget:
+                warnings.append(f"OCR stopped early after reaching time budget ({time_budget}s).")
+                break
+            last_page = page_num + batch_pages - 1
+            if max_pages > 0:
+                last_page = min(last_page, max_pages)
+            try:
+                imgs = convert_from_bytes(
+                    content,
+                    fmt="png",
+                    dpi=max(dpi, 300),
+                    first_page=page_num,
+                    last_page=last_page,
+                )
+            except Exception:
+                break
+            imgs = [maybe_upright(im) for im in imgs]
+            ev_batch, box_batch = ocr_images(imgs, config=dense_cfg)
+            events.extend(ev_batch)
+            boxes.extend(box_batch)
+            page_num = last_page + 1
+            if total_pages and page_num > total_pages:
+                break
+
+    return events, boxes, warnings
+
+
 @app.post("/extract")
 async def extract(file: UploadFile = File(...)):
     content = await file.read()
@@ -195,76 +294,25 @@ async def extract(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Failed to load file: {e}") from e
 
-    events, boxes = ocr_images(images)
-
-    # If OCR returned almost nothing, retry at higher DPI and a different PSM suited for dense text.
-    if is_pdf and len(events) < 5:
-        try:
-            dpi_retry = max(DPI, 300)
-            images_retry = convert_from_bytes(
-                content,
-                fmt="png",
-                dpi=dpi_retry,
-                first_page=1,
-                last_page=MAX_PDF_PAGES if MAX_PDF_PAGES > 0 else None,
-            )
-            events, boxes = ocr_images(images_retry, config="--oem 1 --psm 4")
-        except Exception:
-            pass
-
-    # If still very few events, use a coarse whole-page text pass to salvage content.
-    if len(events) < 5:
-        fallback_events = []
-        for page_idx, img in enumerate(images, start=1):
-            try:
-                text = pytesseract.image_to_string(img, config="--oem 1 --psm 4", lang="eng")
-            except Exception:
-                text = ""
-            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-            for line_idx, line_text in enumerate(lines, start=1):
-                fallback_events.append(
-                    {
-                        "event": line_text,
-                        "notes": line_text,
-                        "page": page_idx,
-                        "line": line_idx,
-                        "confidence": None,
-                        "bbox": None,
-                    }
-                )
-        if len(fallback_events) > len(events):
-            events = fallback_events
-            boxes = []
+    events, boxes, ocr_warnings = ocr_pdf_in_batches(
+        content,
+        dpi=DPI,
+        max_pages=MAX_PDF_PAGES if MAX_PDF_PAGES > 0 else 0,
+        batch_pages=max(BATCH_PAGES, 1),
+        tess_cfg=BASE_TESS_CONFIG,
+        dense_cfg=DENSE_TESS_CONFIG,
+        time_budget=MAX_SECONDS,
+    )
 
     # Merge any sparse text-layer events we collected earlier
     if text_events_for_merge:
         events = text_events_for_merge + events
 
-    if len(events) == 0:
-        # Fallback: plain text extraction per page to avoid empty responses
-        for page_idx, img in enumerate(images, start=1):
-            try:
-                text = pytesseract.image_to_string(img, config="--oem 1 --psm 6", lang="eng")
-            except Exception:
-                text = ""
-            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-            for line_idx, line_text in enumerate(lines, start=1):
-                events.append(
-                    {
-                        "event": line_text,
-                        "notes": line_text,
-                        "page": page_idx,
-                        "line": line_idx,
-                        "confidence": None,
-                        "bbox": None,
-                    }
-                )
-
     return JSONResponse(
         {
             "events": events,
             "boxes": boxes,
-            "warnings": [],
-            "meta": {"sourcePages": len(images), "durationMs": None},
+            "warnings": ocr_warnings,
+            "meta": {"sourcePages": None, "durationMs": None},
         }
     )
