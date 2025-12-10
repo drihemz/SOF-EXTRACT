@@ -209,6 +209,30 @@ async def extract(file: UploadFile = File(...)):
         except Exception:
             pass
 
+    # If still very few events, use a coarse whole-page text pass to salvage content.
+    if len(events) < 5:
+        fallback_events = []
+        for page_idx, img in enumerate(images, start=1):
+            try:
+                text = pytesseract.image_to_string(img, config="--oem 1 --psm 4", lang="eng")
+            except Exception:
+                text = ""
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            for line_idx, line_text in enumerate(lines, start=1):
+                fallback_events.append(
+                    {
+                        "event": line_text,
+                        "notes": line_text,
+                        "page": page_idx,
+                        "line": line_idx,
+                        "confidence": None,
+                        "bbox": None,
+                    }
+                )
+        if len(fallback_events) > len(events):
+            events = fallback_events
+            boxes = []
+
     if len(events) == 0:
         # Fallback: plain text extraction per page to avoid empty responses
         for page_idx, img in enumerate(images, start=1):
