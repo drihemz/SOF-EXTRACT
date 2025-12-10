@@ -8,7 +8,7 @@ import fitz  # PyMuPDF
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from PIL import Image, ImageOps
+from PIL import Image, ImageFilter, ImageOps
 import pytesseract
 
 app = FastAPI()
@@ -28,40 +28,47 @@ DATE_REGEX = re.compile(r"(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})")
 # Tunables via env for performance safeguards
 # Set SOF_MAX_PDF_PAGES=0 (default) to process all pages. Set a positive number to cap for performance if desired.
 MAX_PDF_PAGES = int(os.environ.get("SOF_MAX_PDF_PAGES", "0"))
-DPI = int(os.environ.get("SOF_OCR_DPI", "200"))  # default raster DPI for OCR
+BASE_DPI = int(os.environ.get("SOF_OCR_DPI", "220"))  # default raster DPI for OCR
+DENSE_DPI = int(os.environ.get("SOF_OCR_DENSE_DPI", "280"))  # slightly higher DPI for dense tables
 MAX_FILE_BYTES = int(os.environ.get("SOF_MAX_FILE_BYTES", str(40 * 1024 * 1024)))  # 40MB guard
 MAX_SECONDS = int(os.environ.get("SOF_MAX_SECONDS", "270"))  # keep under proxy timeout
+PER_PAGE_SECONDS = int(os.environ.get("SOF_PAGE_SECONDS", "35"))  # hard ceiling per page to avoid tail spikes
+MIN_TEXT_CHARS = int(os.environ.get("SOF_MIN_TEXT_CHARS", "120"))  # treat page as text-rich above this
 BASE_TESS_CONFIG = os.environ.get("SOF_TESS_CONFIG", "--oem 1 --psm 6 -c preserve_interword_spaces=1")
 DENSE_TESS_CONFIG = os.environ.get("SOF_TESS_CONFIG_DENSE", "--oem 1 --psm 4 -c preserve_interword_spaces=1")
 
 
-def extract_pdf_text_events(content: bytes) -> Tuple[List[Dict], int]:
-    """Fast path: try native text extraction before OCR for digital PDFs."""
-    try:
-        doc = fitz.open(stream=content, filetype="pdf")
-    except Exception:
-        return [], 0
-
+def extract_text_layer_events(page: fitz.Page) -> List[Dict]:
+    """Use the PDF text layer when present to avoid OCR cost and noise."""
     events: List[Dict] = []
-    for page_idx in range(doc.page_count):
-        try:
-            page = doc.load_page(page_idx)
-            text = page.get_text("text") or ""
-        except Exception:
-            text = ""
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        for line_idx, line in enumerate(lines, start=1):
+    raw = {}
+    try:
+        raw = page.get_text("rawdict") or {}
+    except Exception:
+        return events
+
+    blocks = raw.get("blocks", [])
+    for block in blocks:
+        if block.get("type") != 0:  # text blocks only
+            continue
+        for line in block.get("lines", []):
+            spans = line.get("spans", [])
+            text = " ".join(span.get("text", "") for span in spans).strip()
+            if not text:
+                continue
+            x1, y1, x2, y2 = line.get("bbox", (0, 0, 0, 0))
+            bbox = {"x": x1, "y": y1, "width": x2 - x1, "height": y2 - y1}
             events.append(
                 {
-                    "event": line,
-                    "notes": line,
-                    "page": page_idx + 1,
-                    "line": line_idx,
-                    "confidence": 1.0,
-                    "bbox": None,
+                    "event": text,
+                    "notes": text,
+                    "page": page.number + 1,
+                    "line": len(events) + 1,
+                    "confidence": 0.99,
+                    "bbox": bbox,
                 }
             )
-    return events, doc.page_count
+    return events
 
 
 def parse_line_groups(ocr: Dict) -> List[Dict]:
@@ -177,8 +184,42 @@ def preprocess_image(img: Image.Image) -> Image.Image:
     return thresh
 
 
-def ocr_pdf_in_batches(content: bytes, dpi: int, max_pages: int, tess_cfg: str, dense_cfg: str, time_budget: int):
-    """Process PDF pages one by one with a time budget; keeps all pages unless budget is hit."""
+def compute_nonwhite_ratio(gray: Image.Image) -> float:
+    """Estimate how much ink is on the page; used to skip blanks quickly."""
+    hist = gray.histogram()
+    if not hist:
+        return 0.0
+    total = sum(hist)
+    white = hist[-1] if len(hist) >= 256 else 0
+    non_white = total - white
+    return non_white / float(total or 1)
+
+
+def edge_density(gray: Image.Image) -> float:
+    """Cheap proxy for table/line density to decide if we need higher DPI."""
+    edges = gray.filter(ImageFilter.FIND_EDGES)
+    hist = edges.histogram()
+    total = sum(hist)
+    weighted = sum(i * v for i, v in enumerate(hist))
+    return (weighted / float(total or 1)) / 255.0
+
+
+def average_confidence(events: List[Dict]) -> float:
+    vals = [e.get("confidence") for e in events if e.get("confidence") is not None]
+    if not vals:
+        return 0.0
+    return float(sum(vals) / len(vals))
+
+
+def ocr_pdf_in_batches(content: bytes, max_pages: int, tess_cfg: str, dense_cfg: str, time_budget: int):
+    """Process PDF pages one by one with a time budget; keeps all pages unless budget is hit.
+
+    Upgrades:
+    - Use text layer when present (skip OCR on text-rich pages).
+    - Skip near-blank pages.
+    - Adaptive DPI/PSM retry when confidence/coverage is low.
+    - Hard per-page budget to avoid tail latency.
+    """
     start_time = time.monotonic()
     events: List[Dict] = []
     boxes: List[Dict] = []
@@ -192,20 +233,52 @@ def ocr_pdf_in_batches(content: bytes, dpi: int, max_pages: int, tess_cfg: str, 
 
     limit = max_pages if max_pages > 0 else total_pages
     for page_idx in range(limit):
-        if time.monotonic() - start_time > time_budget:
+        elapsed = time.monotonic() - start_time
+        if elapsed > time_budget:
             warnings.append(f"OCR stopped early after reaching time budget ({time_budget}s).")
             break
 
+        page_start = time.monotonic()
         page = doc.load_page(page_idx)
-        # Render page
-        img = render_page_to_pil(page, dpi=dpi)
-        img = preprocess_image(img)
+
+        # Fast path: rich text layer available
+        text_preview = ""
+        try:
+            text_preview = page.get_text("text") or ""
+        except Exception:
+            text_preview = ""
+        if len(text_preview) >= MIN_TEXT_CHARS:
+            text_events = extract_text_layer_events(page)
+            events.extend(text_events)
+            # Text-layer path does not produce boxes; acceptable since confidence is high.
+            continue
+
+        # Render page at base DPI
+        img = render_page_to_pil(page, dpi=BASE_DPI)
+        gray = preprocess_image(img)
+
+        # Skip blank or near-blank pages quickly
+        if compute_nonwhite_ratio(gray) < 0.005:
+            warnings.append(f"Page {page_idx + 1} skipped (looks blank).")
+            continue
+
+        # Dense table heuristic: lots of edges imply smaller text → bump DPI for this page
+        if edge_density(gray) > 0.08 and DENSE_DPI > BASE_DPI:
+            img = render_page_to_pil(page, dpi=DENSE_DPI)
+            gray = preprocess_image(img)
 
         # Primary OCR
-        ev_batch, box_batch = ocr_images([img], config=tess_cfg)
-        # If sparse, retry dense
-        if len(ev_batch) < 3:
-            ev_batch, box_batch = ocr_images([img], config=dense_cfg)
+        ev_batch, box_batch = ocr_images([gray], config=tess_cfg)
+        conf_avg = average_confidence(ev_batch)
+
+        # Targeted re-run with denser PSM/DPI when the pass looks weak and we still have budget
+        if (len(ev_batch) < 3 or conf_avg < 0.55) and (time.monotonic() - page_start) < PER_PAGE_SECONDS:
+            if DENSE_DPI > BASE_DPI:
+                img = render_page_to_pil(page, dpi=DENSE_DPI)
+                gray = preprocess_image(img)
+            ev_retry, box_retry = ocr_images([gray], config=dense_cfg)
+            if len(ev_retry) > len(ev_batch) or average_confidence(ev_retry) > conf_avg:
+                ev_batch, box_batch = ev_retry, box_retry
 
         # Attach page index metadata
         for ev in ev_batch:
@@ -226,22 +299,6 @@ async def extract(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Empty file")
 
     is_pdf = file.filename.lower().endswith(".pdf")
-    text_events_for_merge: List[Dict] = []
-    page_count = None
-
-    if is_pdf:
-        text_events, page_count = extract_pdf_text_events(content)
-        if len(text_events) >= 5:
-            return JSONResponse(
-                {
-                    "events": text_events,
-                    "boxes": [],
-                    "warnings": [],
-                    "meta": {"sourcePages": page_count or None, "durationMs": None},
-                }
-            )
-        # If text layer is too sparse, keep these lines and fall through to OCR to try to enrich
-        text_events_for_merge = text_events or []
 
     if len(content) > MAX_FILE_BYTES:
         raise HTTPException(
@@ -253,7 +310,6 @@ async def extract(file: UploadFile = File(...)):
     if is_pdf:
         events, boxes, ocr_warnings, page_count = ocr_pdf_in_batches(
             content,
-            dpi=DPI,
             max_pages=MAX_PDF_PAGES if MAX_PDF_PAGES > 0 else 0,
             tess_cfg=BASE_TESS_CONFIG,
             dense_cfg=DENSE_TESS_CONFIG,
@@ -267,10 +323,6 @@ async def extract(file: UploadFile = File(...)):
         events, boxes = ocr_images(images)
         ocr_warnings = []
         page_count = len(images)
-
-    # Merge any sparse text-layer events we collected earlier
-    if text_events_for_merge:
-        events = text_events_for_merge + events
 
     return JSONResponse(
         {
