@@ -23,7 +23,7 @@ app.add_middleware(
 )
 
 TIME_REGEX = re.compile(r"(\d{1,2}[:h\.]\d{2})", re.IGNORECASE)
-DATE_REGEX = re.compile(r"(\d{1,2}[\/\-\.]\d{1,2}[\/\-]\d{2,4})")
+DATE_REGEX = re.compile(r"(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})")
 
 # Tunables via env for performance safeguards
 # Set SOF_MAX_PDF_PAGES=0 (default) to process all pages. Set a positive number to cap for performance if desired.
@@ -38,14 +38,71 @@ BASE_TESS_CONFIG = os.environ.get("SOF_TESS_CONFIG", "--oem 1 --psm 6 -c preserv
 DENSE_TESS_CONFIG = os.environ.get("SOF_TESS_CONFIG_DENSE", "--oem 1 --psm 4 -c preserve_interword_spaces=1")
 
 
+def _sanitize_time(val: Optional[str]) -> Optional[str]:
+    if not val:
+        return None
+    parts = val.split(":")
+    if len(parts) != 2:
+        return None
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1])
+    except ValueError:
+        return None
+    if hour > 23 or minute > 59:
+        return None
+    return f"{hour:02d}:{minute:02d}"
+
+
 def _normalize_times(times: List[str]) -> Tuple[Optional[str], Optional[str]]:
-    """Normalize time strings like 15h20 or 00.00 to HH:MM."""
+    """Normalize time strings like 15h20 or 00.00 to HH:MM and drop impossible times."""
     start = end = None
     if len(times) >= 1:
-        start = times[0].lower().replace("h", ":").replace(".", ":")
+        start = _sanitize_time(times[0].lower().replace("h", ":").replace(".", ":"))
     if len(times) >= 2:
-        end = times[1].lower().replace("h", ":").replace(".", ":")
+        end = _sanitize_time(times[1].lower().replace("h", ":").replace(".", ":"))
     return start, end
+
+
+def extract_times_and_dates(text: str) -> Tuple[List[str], List[str]]:
+    """
+    Extract normalized times (HH:MM) and raw date strings from a line of text.
+
+    - Detects dates first (dd/mm/yy, dd-mm-yy, dd.mm.yy).
+    - Skips time candidates that are clearly part of a date substring (e.g., 28.07 in 28.07.24).
+    - Validates hour/minute ranges and drops impossible times.
+    """
+    dates = DATE_REGEX.findall(text) or []
+    times_raw = TIME_REGEX.findall(text) or []
+
+    cleaned_times: List[str] = []
+    for t in times_raw:
+        # If this candidate is a prefix of a date like "28.07.24", treat as date, not time
+        if "." in t and any(d.startswith(t) for d in dates):
+            continue
+        t_norm = t.lower().replace("h", ":")
+        if "." in t_norm:
+            t_norm = t_norm.replace(".", ":")
+        parts = t_norm.split(":")
+        if len(parts) != 2:
+            continue
+        try:
+            h = int(parts[0])
+            m = int(parts[1])
+        except ValueError:
+            continue
+        if not (0 <= h <= 24 and 0 <= m < 60):
+            continue
+        cleaned_times.append(f"{h:02d}:{m:02d}")
+
+    seen = set()
+    unique_times: List[str] = []
+    for t in cleaned_times:
+        if t not in seen:
+            seen.add(t)
+            unique_times.append(t)
+
+    return unique_times, dates
 
 
 def extract_text_layer_events(page: fitz.Page) -> List[Dict]:
@@ -67,9 +124,9 @@ def extract_text_layer_events(page: fitz.Page) -> List[Dict]:
             text = " ".join(span.get("text", "") for span in spans).strip()
             if not text:
                 continue
-            times = TIME_REGEX.findall(text)
-            dates = DATE_REGEX.findall(text)
-            start, end = _normalize_times(times)
+            times, dates = extract_times_and_dates(text)
+            start = times[0] if times else None
+            end = times[1] if len(times) > 1 else None
             x1, y1, x2, y2 = line.get("bbox", (0, 0, 0, 0))
             bbox = {"x": x1, "y": y1, "width": x2 - x1, "height": y2 - y1}
             line_counter += 1
@@ -140,6 +197,7 @@ def parse_line_groups(ocr: Dict) -> List[Dict]:
 def ocr_images(images: List[Image.Image], config: str = "--oem 1 --psm 6", base_page_index: int = 1):
     events = []
     boxes = []
+    seen_lines = set()
     for offset, img in enumerate(images):
         page_idx = base_page_index + offset
         # Better OCR defaults: OEM 1 (LSTM), configurable PSM
@@ -149,9 +207,14 @@ def ocr_images(images: List[Image.Image], config: str = "--oem 1 --psm 6", base_
             clean = line["text"].strip()
             if not clean:
                 continue
-            times = TIME_REGEX.findall(clean)
-            dates = DATE_REGEX.findall(clean)
-            start, end = _normalize_times(times)
+            # Avoid duplicate lines within the same page batch
+            line_key = (page_idx, clean)
+            if line_key in seen_lines:
+                continue
+            seen_lines.add(line_key)
+            times, dates = extract_times_and_dates(clean)
+            start = times[0] if len(times) >= 1 else None
+            end = times[1] if len(times) >= 2 else None
             events.append(
                 {
                     "event": clean,
@@ -231,6 +294,25 @@ def mark_low_quality_events(events: List[Dict], threshold: float = 0.5):
     for ev in events:
         conf = ev.get("confidence")
         ev["quality"] = "low" if conf is not None and conf < threshold else "ok"
+
+
+def _digit_ratio(text: str) -> float:
+    if not text:
+        return 0.0
+    digits = sum(ch.isdigit() for ch in text)
+    return digits / float(len(text))
+
+
+def dedupe_events(events: List[Dict]) -> List[Dict]:
+    seen = set()
+    out: List[Dict] = []
+    for e in events:
+        key = (e.get("page"), e.get("line"), e.get("event"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(e)
+    return out
 
 
 def ocr_pdf_in_batches(content: bytes, max_pages: int, tess_cfg: str, dense_cfg: str, time_budget: int):
@@ -314,6 +396,16 @@ def ocr_pdf_in_batches(content: bytes, max_pages: int, tess_cfg: str, dense_cfg:
         for b in box_batch:
             b["page"] = page_idx + 1
 
+        # Filter out obvious noise-only lines (numeric blobs without time/date)
+        filtered_events = []
+        for ev in ev_batch:
+            has_time = ev.get("start") or ev.get("end")
+            has_date = ev.get("dates")
+            if not has_time and not has_date and _digit_ratio(ev.get("event", "")) > 0.7 and ev.get("confidence", 0) < 0.55:
+                continue
+            filtered_events.append(ev)
+        ev_batch = filtered_events
+
         events.extend(ev_batch)
         boxes.extend(box_batch)
 
@@ -322,6 +414,7 @@ def ocr_pdf_in_batches(content: bytes, max_pages: int, tess_cfg: str, dense_cfg:
                 f"Page {page_idx + 1} processing reached per-page time budget ({PER_PAGE_SECONDS}s); no further retries attempted."
             )
 
+    events = dedupe_events(events)
     return events, boxes, warnings, total_pages
 
 
