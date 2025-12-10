@@ -28,14 +28,15 @@ DATE_REGEX = re.compile(r"(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})")
 # Tunables via env for performance safeguards
 # Set SOF_MAX_PDF_PAGES=0 (default) to process all pages. Set a positive number to cap for performance if desired.
 MAX_PDF_PAGES = int(os.environ.get("SOF_MAX_PDF_PAGES", "0"))
-BASE_DPI = int(os.environ.get("SOF_OCR_DPI", "220"))  # default raster DPI for OCR
-DENSE_DPI = int(os.environ.get("SOF_OCR_DENSE_DPI", "280"))  # slightly higher DPI for dense tables
+BASE_DPI = int(os.environ.get("SOF_OCR_DPI", "200"))  # default raster DPI for OCR (conservative)
+DENSE_DPI = int(os.environ.get("SOF_OCR_DENSE_DPI", "240"))  # slightly higher DPI for dense tables
 MAX_FILE_BYTES = int(os.environ.get("SOF_MAX_FILE_BYTES", str(40 * 1024 * 1024)))  # 40MB guard
-MAX_SECONDS = int(os.environ.get("SOF_MAX_SECONDS", "270"))  # keep under proxy timeout
-PER_PAGE_SECONDS = int(os.environ.get("SOF_PAGE_SECONDS", "35"))  # hard ceiling per page to avoid tail spikes
+MAX_SECONDS = int(os.environ.get("SOF_MAX_SECONDS", "180"))  # keep under proxy timeout
+PER_PAGE_SECONDS = int(os.environ.get("SOF_PAGE_SECONDS", "20"))  # hard ceiling per page to avoid tail spikes
 MIN_TEXT_CHARS = int(os.environ.get("SOF_MIN_TEXT_CHARS", "120"))  # treat page as text-rich above this
 BASE_TESS_CONFIG = os.environ.get("SOF_TESS_CONFIG", "--oem 1 --psm 6 -c preserve_interword_spaces=1")
 DENSE_TESS_CONFIG = os.environ.get("SOF_TESS_CONFIG_DENSE", "--oem 1 --psm 4 -c preserve_interword_spaces=1")
+TESSERACT_TIMEOUT = int(os.environ.get("SOF_TESS_TIMEOUT", "12"))  # per-call Tesseract timeout in seconds
 
 
 def _sanitize_time(val: Optional[str]) -> Optional[str]:
@@ -201,7 +202,25 @@ def ocr_images(images: List[Image.Image], config: str = "--oem 1 --psm 6", base_
     for offset, img in enumerate(images):
         page_idx = base_page_index + offset
         # Better OCR defaults: OEM 1 (LSTM), configurable PSM
-        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT, config=config, lang="eng")
+        try:
+            data = pytesseract.image_to_data(
+                img,
+                output_type=pytesseract.Output.DICT,
+                config=config,
+                lang="eng",
+                timeout=TESSERACT_TIMEOUT,
+            )
+        except RuntimeError as e:
+            boxes.append(
+                {
+                    "page": page_idx,
+                    "line": 0,
+                    "text": f"OCR timeout on page {page_idx}: {e}",
+                    "bbox": {"x": 0, "y": 0, "width": 0, "height": 0},
+                    "confidence": 0.0,
+                }
+            )
+            continue
         lines = parse_line_groups(data)
         for line_idx, line in enumerate(lines, start=1):
             clean = line["text"].strip()
@@ -342,6 +361,7 @@ def ocr_pdf_in_batches(content: bytes, max_pages: int, tess_cfg: str, dense_cfg:
         if elapsed > time_budget:
             warnings.append(f"OCR stopped early after reaching time budget ({time_budget}s).")
             break
+        near_budget = (time_budget - elapsed) < (PER_PAGE_SECONDS * 1.5)
 
         page_start = time.monotonic()
         page = doc.load_page(page_idx)
@@ -369,7 +389,7 @@ def ocr_pdf_in_batches(content: bytes, max_pages: int, tess_cfg: str, dense_cfg:
             continue
 
         # Dense table heuristic: lots of edges imply smaller text → bump DPI for this page
-        if edge_density(gray) > 0.08 and DENSE_DPI > BASE_DPI:
+        if not near_budget and edge_density(gray) > 0.08 and DENSE_DPI > BASE_DPI:
             img = render_page_to_pil(page, dpi=DENSE_DPI)
             gray = preprocess_image(img)
             used_dpi = DENSE_DPI
@@ -380,7 +400,9 @@ def ocr_pdf_in_batches(content: bytes, max_pages: int, tess_cfg: str, dense_cfg:
         mark_low_quality_events(ev_batch, threshold=0.5)
 
         # Targeted re-run with denser PSM/DPI when the pass looks weak and we still have budget
-        if (len(ev_batch) < 3 or conf_avg < 0.55) and (time.monotonic() - page_start) < PER_PAGE_SECONDS:
+        bad_coverage = len(ev_batch) < 2
+        bad_conf = conf_avg < 0.40
+        if (bad_coverage or bad_conf) and (time.monotonic() - page_start) < PER_PAGE_SECONDS and not near_budget:
             if DENSE_DPI > used_dpi:
                 img = render_page_to_pil(page, dpi=DENSE_DPI)
                 gray = preprocess_image(img)
