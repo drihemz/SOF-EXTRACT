@@ -28,15 +28,16 @@ DATE_REGEX = re.compile(r"(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})")
 # Tunables via env for performance safeguards
 # Set SOF_MAX_PDF_PAGES=0 (default) to process all pages. Set a positive number to cap for performance if desired.
 MAX_PDF_PAGES = int(os.environ.get("SOF_MAX_PDF_PAGES", "0"))
-BASE_DPI = int(os.environ.get("SOF_OCR_DPI", "200"))  # default raster DPI for OCR (conservative)
-DENSE_DPI = int(os.environ.get("SOF_OCR_DENSE_DPI", "240"))  # slightly higher DPI for dense tables
+PREVIEW_DPI = int(os.environ.get("SOF_PREVIEW_DPI", "96"))  # low-DPI preview for cheap blank detection
+BASE_DPI = int(os.environ.get("SOF_OCR_DPI", "190"))  # default raster DPI for OCR (conservative)
+DENSE_DPI = int(os.environ.get("SOF_OCR_DENSE_DPI", "240"))  # kept for compatibility; dense pass disabled in fast path
 MAX_FILE_BYTES = int(os.environ.get("SOF_MAX_FILE_BYTES", str(40 * 1024 * 1024)))  # 40MB guard
 MAX_SECONDS = int(os.environ.get("SOF_MAX_SECONDS", "180"))  # keep under proxy timeout
-PER_PAGE_SECONDS = int(os.environ.get("SOF_PAGE_SECONDS", "20"))  # hard ceiling per page to avoid tail spikes
+PER_PAGE_SECONDS = int(os.environ.get("SOF_PAGE_SECONDS", "30"))  # hard ceiling per page to avoid tail spikes
 MIN_TEXT_CHARS = int(os.environ.get("SOF_MIN_TEXT_CHARS", "120"))  # treat page as text-rich above this
 BASE_TESS_CONFIG = os.environ.get("SOF_TESS_CONFIG", "--oem 1 --psm 6 -c preserve_interword_spaces=1")
 DENSE_TESS_CONFIG = os.environ.get("SOF_TESS_CONFIG_DENSE", "--oem 1 --psm 4 -c preserve_interword_spaces=1")
-TESSERACT_TIMEOUT = int(os.environ.get("SOF_TESS_TIMEOUT", "12"))  # per-call Tesseract timeout in seconds
+TESSERACT_TIMEOUT = int(os.environ.get("SOF_TESS_TIMEOUT", "10"))  # per-call Tesseract timeout in seconds
 
 
 def _sanitize_time(val: Optional[str]) -> Optional[str]:
@@ -273,6 +274,14 @@ def render_page_to_pil(page: fitz.Page, dpi: int) -> Image.Image:
     return img
 
 
+def render_preview_gray(page: fitz.Page, dpi: int) -> Image.Image:
+    """Low-DPI grayscale render for cheap blank detection."""
+    zoom = dpi / 72
+    mat = fitz.Matrix(zoom, zoom)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    return Image.frombytes("L", (pix.width, pix.height), pix.samples)
+
+
 def preprocess_image(img: Image.Image) -> Image.Image:
     """Lightweight preprocessing: grayscale + autocontrast + slight threshold."""
     gray = img.convert("L")
@@ -361,7 +370,6 @@ def ocr_pdf_in_batches(content: bytes, max_pages: int, tess_cfg: str, dense_cfg:
         if elapsed > time_budget:
             warnings.append(f"OCR stopped early after reaching time budget ({time_budget}s).")
             break
-        near_budget = (time_budget - elapsed) < (PER_PAGE_SECONDS * 1.5)
 
         page_start = time.monotonic()
         page = doc.load_page(page_idx)
@@ -378,39 +386,24 @@ def ocr_pdf_in_batches(content: bytes, max_pages: int, tess_cfg: str, dense_cfg:
             # Text-layer path does not produce boxes; acceptable since confidence is high.
             continue
 
-        # Render page at base DPI
-        used_dpi = BASE_DPI
+        # Cheap preview to skip blanks
+        preview_gray = render_preview_gray(page, dpi=PREVIEW_DPI)
+        if compute_nonwhite_ratio(preview_gray) < 0.003:
+            warnings.append(f"Page {page_idx + 1} skipped (looks blank on preview).")
+            continue
+
+        # Single render at base DPI
         img = render_page_to_pil(page, dpi=BASE_DPI)
         gray = preprocess_image(img)
 
-        # Skip blank or near-blank pages quickly
-        if compute_nonwhite_ratio(gray) < 0.005:
-            warnings.append(f"Page {page_idx + 1} skipped (looks blank).")
-            continue
-
-        # Dense table heuristic: lots of edges imply smaller text → bump DPI for this page
-        if not near_budget and edge_density(gray) > 0.08 and DENSE_DPI > BASE_DPI:
-            img = render_page_to_pil(page, dpi=DENSE_DPI)
-            gray = preprocess_image(img)
-            used_dpi = DENSE_DPI
-
-        # Primary OCR
-        ev_batch, box_batch = ocr_images([gray], config=tess_cfg, base_page_index=page_idx + 1)
+        # Single OCR pass, bounded by Tesseract timeout
+        ev_batch, box_batch = ocr_images(
+            [gray],
+            config=tess_cfg,
+            base_page_index=page_idx + 1,
+        )
         conf_avg = average_confidence(ev_batch)
         mark_low_quality_events(ev_batch, threshold=0.5)
-
-        # Targeted re-run with denser PSM/DPI when the pass looks weak and we still have budget
-        bad_coverage = len(ev_batch) < 2
-        bad_conf = conf_avg < 0.40
-        if (bad_coverage or bad_conf) and (time.monotonic() - page_start) < PER_PAGE_SECONDS and not near_budget:
-            if DENSE_DPI > used_dpi:
-                img = render_page_to_pil(page, dpi=DENSE_DPI)
-                gray = preprocess_image(img)
-                used_dpi = DENSE_DPI
-            ev_retry, box_retry = ocr_images([gray], config=dense_cfg, base_page_index=page_idx + 1)
-            mark_low_quality_events(ev_retry, threshold=0.5)
-            if len(ev_retry) > len(ev_batch) or average_confidence(ev_retry) > conf_avg:
-                ev_batch, box_batch = ev_retry, box_retry
 
         # Attach page index metadata (override any local indexing)
         for ev in ev_batch:
@@ -433,7 +426,7 @@ def ocr_pdf_in_batches(content: bytes, max_pages: int, tess_cfg: str, dense_cfg:
 
         if time.monotonic() - page_start > PER_PAGE_SECONDS:
             warnings.append(
-                f"Page {page_idx + 1} processing reached per-page time budget ({PER_PAGE_SECONDS}s); no further retries attempted."
+                f"Page {page_idx + 1} processing reached per-page time budget ({PER_PAGE_SECONDS}s); OCR result kept, no extra work attempted."
             )
 
     events = dedupe_events(events)
