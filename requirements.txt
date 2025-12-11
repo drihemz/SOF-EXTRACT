@@ -1,9 +1,9 @@
 fastapi
 uvicorn[standard]
-python-multipart
-pillow
 pdf2image
-
-# OCR engine (CPU only)
-paddlepaddle==2.6.2
-paddleocr==2.7.0.3
+pillow
+python-multipart
+PyPDF2
+PyMuPDF
+paddleocr
+paddlepaddle==2.6.1
