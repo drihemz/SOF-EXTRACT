@@ -23,282 +23,164 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------------------------------------------------------------------
-# Regex for time / date extraction (SOF-style)
-# ---------------------------------------------------------------------------
-
+# Regex for times & dates
 TIME_REGEX = re.compile(r"(\d{1,2}[:h\.]\d{2})", re.IGNORECASE)
 DATE_REGEX = re.compile(r"(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})")
 
-# ---------------------------------------------------------------------------
-# Tunables (env)
-# ---------------------------------------------------------------------------
+# Settings
+MAX_FILE_BYTES = 40 * 1024 * 1024
+MAX_SECONDS = 260
+OCR_DPI = 200
+MIN_INK_RATIO = 0.001
 
-MAX_FILE_BYTES = int(os.environ.get("SOF_MAX_FILE_BYTES", str(40 * 1024 * 1024)))  # 40MB guard
-MAX_SECONDS = int(os.environ.get("SOF_MAX_SECONDS", "260"))  # global soft guard
-
-MAX_PDF_PAGES = int(os.environ.get("SOF_MAX_PDF_PAGES", "0"))  # 0 => all pages
-OCR_DPI = int(os.environ.get("SOF_OCR_DPI", "200"))  # render DPI for pdf2image
-MIN_INK_RATIO = float(os.environ.get("SOF_MIN_INK_RATIO", "0.001"))  # blank page cutoff
-
-# PaddleOCR config
-OCR_LANG = os.environ.get("SOF_OCR_LANG", "en")
-
-# Instantiate PaddleOCR once (CPU only)
-paddle_ocr = PaddleOCR(
+# Paddle OCR engine (CPU)
+ocr = PaddleOCR(
     use_angle_cls=True,
-    lang=OCR_LANG,
+    lang="en",
     use_gpu=False,
     show_log=False,
 )
 
+# Helpers ------------------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Time / date helpers
-# ---------------------------------------------------------------------------
-
-def _sanitize_time(val: Optional[str]) -> Optional[str]:
-    if not val:
-        return None
-    parts = val.split(":")
-    if len(parts) != 2:
-        return None
-    try:
-        hour = int(parts[0])
-        minute = int(parts[1])
-    except ValueError:
-        return None
-    if hour > 23 or minute > 59:
-        return None
-    return f"{hour:02d}:{minute:02d}"
-
-
-def extract_times_and_dates(text: str) -> Tuple[List[str], List[str]]:
-    """
-    Extract normalized times (HH:MM) and raw date strings from a line of text.
-
-    - Detects dates first (dd/mm/yy, dd-mm-yy, dd.mm.yy).
-    - Skips time candidates that are clearly part of a date substring (e.g., 28.07 in 28.07.24).
-    - Validates hour/minute ranges and drops impossible times.
-    """
+def extract_times_and_dates(text: str):
     dates = DATE_REGEX.findall(text) or []
     times_raw = TIME_REGEX.findall(text) or []
 
-    cleaned_times: List[str] = []
+    cleaned = []
     for t in times_raw:
-        # If this candidate is a prefix of a date like "28.07.24", treat as date, not time
         if "." in t and any(d.startswith(t) for d in dates):
             continue
-        t_norm = t.lower().replace("h", ":")
-        if "." in t_norm:
-            t_norm = t_norm.replace(".", ":")
-        parts = t_norm.split(":")
+        t2 = t.lower().replace("h", ":").replace(".", ":")
+        parts = t2.split(":")
         if len(parts) != 2:
             continue
         try:
-            h = int(parts[0])
-            m = int(parts[1])
-        except ValueError:
+            h = int(parts[0]); m = int(parts[1])
+        except:
             continue
-        if not (0 <= h <= 24 and 0 <= m < 60):
-            continue
-        cleaned_times.append(f"{h:02d}:{m:02d}")
-
-    seen = set()
-    unique_times: List[str] = []
-    for t in cleaned_times:
-        if t not in seen:
-            seen.add(t)
-            unique_times.append(t)
-
-    return unique_times, dates
-
-
-# ---------------------------------------------------------------------------
-# Simple ink / blank-page heuristic
-# ---------------------------------------------------------------------------
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            cleaned.append(f"{h:02d}:{m:02d}")
+    return cleaned, dates
 
 def compute_nonwhite_ratio(img: Image.Image) -> float:
-    """
-    img: grayscale or RGB PIL image.
-    Returns fraction of non-white-ish pixels, used to skip blanks.
-    """
-    if img.mode != "L":
-        gray = img.convert("L")
-    else:
-        gray = img
-    hist = gray.histogram()
-    if not hist:
-        return 0.0
+    g = img.convert("L")
+    hist = g.histogram()
     total = sum(hist)
-    white = hist[-1] if len(hist) >= 256 else 0
-    non_white = total - white
-    return non_white / float(total or 1)
+    white = hist[-1]
+    return (total - white) / max(total, 1)
 
+def paddle_ocr_page(img: Image.Image, page_index: int):
+    events, boxes = [], []
 
-# ---------------------------------------------------------------------------
-# Core PaddleOCR wrapper
-# ---------------------------------------------------------------------------
-
-def paddle_ocr_page(img: Image.Image, page_index: int) -> Tuple[List[Dict], List[Dict]]:
-    """
-    Run PaddleOCR on a single page image and convert results into events + boxes.
-    """
-    events: List[Dict] = []
-    boxes: List[Dict] = []
-
-    # PaddleOCR works with numpy arrays (H, W, 3).
     if img.mode != "RGB":
         img = img.convert("RGB")
-    img_np = np.array(img)
+    arr = np.array(img)
 
-    result = paddle_ocr.ocr(img_np, cls=True)
-
+    result = ocr.ocr(arr, cls=True)
     if not result or not result[0]:
         return events, boxes
 
-    # sort lines by vertical position
-    lines = []
-    for line in result[0]:
-        box, (txt, score) = line
-        xs = [p[0] for p in box]
-        ys = [p[1] for p in box]
+    # sort by vertical center
+    rows = []
+    for box, (txt, score) in result[0]:
+        xs = [p[0] for p in box]; ys = [p[1] for p in box]
         x1, x2 = min(xs), max(xs)
         y1, y2 = min(ys), max(ys)
-        y_center = (y1 + y2) / 2.0
-        lines.append({
+        rows.append({
             "text": txt.strip(),
             "score": float(score),
-            "bbox": {"x": float(x1), "y": float(y1), "width": float(x2 - x1), "height": float(y2 - y1)},
-            "y_center": float(y_center),
+            "bbox": {
+                "x": float(x1), "y": float(y1),
+                "width": float(x2 - x1), "height": float(y2 - y1)
+            },
+            "y_center": (y1 + y2) / 2,
         })
 
-    lines.sort(key=lambda l: l["y_center"])
+    rows.sort(key=lambda r: r["y_center"])
 
-    for idx, line in enumerate(lines, start=1):
-        text = line["text"]
-        if not text:
-            continue
-        times, dates = extract_times_and_dates(text)
+    events_out, boxes_out = [], []
+    for i, row in enumerate(rows, 1):
+        t = row["text"]
+        times, dates = extract_times_and_dates(t)
         start = times[0] if len(times) >= 1 else None
-        end = times[1] if len(times) >= 2 else None
+        end   = times[1] if len(times) >= 2 else None
 
         ev = {
-            "event": text,
-            "notes": text,
+            "event": t,
+            "notes": t,
             "start": start,
             "end": end,
-            "dates": list(dict.fromkeys(dates)),
-            "ratePercent": None,
-            "behavior": None,
+            "dates": dates,
             "page": page_index,
-            "line": idx,
-            "confidence": line["score"],
-            "bbox": line["bbox"],
+            "line": i,
+            "confidence": row["score"],
+            "bbox": row["bbox"],
         }
-        events.append(ev)
-        boxes.append(
-            {
-                "page": page_index,
-                "line": idx,
-                "text": text,
-                "bbox": line["bbox"],
-                "confidence": line["score"],
-            }
-        )
+        events_out.append(ev)
 
-    return events, boxes
+        boxes_out.append({
+            "page": page_index,
+            "line": i,
+            "text": t,
+            "bbox": row["bbox"],
+            "confidence": row["score"],
+        })
 
+    return events_out, boxes_out
 
-# ---------------------------------------------------------------------------
-# PDF pipeline (pdf2image + PaddleOCR)
-# ---------------------------------------------------------------------------
-
-def ocr_pdf_with_paddle(content: bytes) -> Tuple[List[Dict], List[Dict], List[str], int]:
+def ocr_pdf(content: bytes):
     start = time.monotonic()
-    warnings: List[str] = []
-    events: List[Dict] = []
-    boxes: List[Dict] = []
+    events, boxes, warnings = [], [], []
 
-    # Render all pages to images
     try:
-        images = convert_from_bytes(content, dpi=OCR_DPI)
+        pages = convert_from_bytes(content, dpi=OCR_DPI)
     except Exception as e:
-        return [], [], [f"Failed to convert PDF to images: {e}"], 0
+        return [], [], [f"PDF conversion failed: {e}"], 0
 
-    total_pages = len(images)
-    limit = MAX_PDF_PAGES if MAX_PDF_PAGES > 0 else total_pages
-    limit = min(limit, total_pages)
-
-    for page_idx in range(limit):
+    for idx, img in enumerate(pages, 1):
         if time.monotonic() - start > MAX_SECONDS:
-            warnings.append(f"OCR stopped early after reaching time budget ({MAX_SECONDS}s).")
+            warnings.append("Time budget exceeded.")
             break
 
-        img = images[page_idx]
-
-        # Skip near-blank pages
         if compute_nonwhite_ratio(img) < MIN_INK_RATIO:
-            warnings.append(f"Page {page_idx + 1} skipped (looks blank).")
+            warnings.append(f"Page {idx} looks blank.")
             continue
 
-        page_events, page_boxes = paddle_ocr_page(img, page_index=page_idx + 1)
-        events.extend(page_events)
-        boxes.extend(page_boxes)
+        ev, bx = paddle_ocr_page(img, idx)
+        events.extend(ev)
+        boxes.extend(bx)
 
-    return events, boxes, warnings, total_pages
+    return events, boxes, warnings, len(pages)
 
-
-# ---------------------------------------------------------------------------
-# FastAPI endpoint
-# ---------------------------------------------------------------------------
+# API -----------------------------------------------------------------------------------------
 
 @app.post("/extract")
 async def extract(file: UploadFile = File(...)):
-    req_start = time.monotonic()
-    content = await file.read()
-
-    if not content:
+    raw = await file.read()
+    if not raw:
         raise HTTPException(status_code=400, detail="Empty file")
+    if len(raw) > MAX_FILE_BYTES:
+        raise HTTPException(status_code=413, detail="File too large")
 
-    if len(content) > MAX_FILE_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File too large for OCR (>{MAX_FILE_BYTES // (1024*1024)} MB). Please trim pages or reduce size.",
-        )
-
-    filename = (file.filename or "").lower()
-    is_pdf = filename.endswith(".pdf")
+    is_pdf = file.filename.lower().endswith(".pdf")
 
     if is_pdf:
-        events, boxes, ocr_warnings, page_count = ocr_pdf_with_paddle(content)
+        events, boxes, warnings, total = ocr_pdf(raw)
     else:
-        # Treat as a single image
         try:
-            img = Image.open(io.BytesIO(content))
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to load image: {e}") from e
+            img = Image.open(io.BytesIO(raw))
+        except:
+            raise HTTPException(status_code=400, detail="Invalid image")
+        events, boxes = paddle_ocr_page(img, 1)
+        warnings, total = [], 1
 
-        if compute_nonwhite_ratio(img) < MIN_INK_RATIO:
-            ocr_warnings = ["Image looks blank."]
-            events, boxes = [], []
-        else:
-            events, boxes = paddle_ocr_page(img, page_index=1)
-            ocr_warnings = []
-        page_count = 1
-
-    duration_ms = int((time.monotonic() - req_start) * 1000)
-
-    return JSONResponse(
-        {
-            "events": events,
-            "boxes": boxes,
-            "warnings": ocr_warnings,
-            "meta": {
-                "sourcePages": page_count,
-                "durationMs": duration_ms,
-                "maxSeconds": MAX_SECONDS,
-                "ocrDpi": OCR_DPI,
-            },
+    return JSONResponse({
+        "events": events,
+        "boxes": boxes,
+        "warnings": warnings,
+        "meta": {
+            "sourcePages": total,
+            "ocrDpi": OCR_DPI
         }
-    )
+    })
