@@ -1,13 +1,11 @@
 FROM python:3.11-slim
 
-# System deps: tesseract + OCRmyPDF dependencies
+# System deps for OpenCV/Pillow etc.
 RUN apt-get update && apt-get install -y \
-    tesseract-ocr \
-    tesseract-ocr-eng \
-    ghostscript \
-    qpdf \
-    unpaper \
-    pngquant \
+    libglib2.0-0 \
+    libsm6 \
+    libxrender1 \
+    libxext6 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

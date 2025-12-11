@@ -2,16 +2,15 @@ import io
 import os
 import re
 import time
-import tempfile
 from typing import Dict, List, Optional, Tuple
 
 import fitz  # PyMuPDF
+import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from PIL import Image, ImageOps
-import pytesseract
-import ocrmypdf
+from PIL import Image
+from paddleocr import PaddleOCR
 
 app = FastAPI()
 
@@ -25,7 +24,7 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
-# Regex for time / date extraction
+# Regex for time / date extraction (SOF-friendly)
 # ---------------------------------------------------------------------------
 
 TIME_REGEX = re.compile(r"(\d{1,2}[:h\.]\d{2})", re.IGNORECASE)
@@ -36,23 +35,26 @@ DATE_REGEX = re.compile(r"(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})")
 # ---------------------------------------------------------------------------
 
 MAX_FILE_BYTES = int(os.environ.get("SOF_MAX_FILE_BYTES", str(40 * 1024 * 1024)))  # 40MB guard
-MIN_TEXT_CHARS = int(os.environ.get("SOF_MIN_TEXT_CHARS", "80"))  # text-rich threshold
-MAX_SECONDS = int(os.environ.get("SOF_MAX_SECONDS", "300"))  # global soft guard
+MAX_SECONDS = int(os.environ.get("SOF_MAX_SECONDS", "260"))  # global soft guard
+MAX_PDF_PAGES = int(os.environ.get("SOF_MAX_PDF_PAGES", "0"))  # 0 => all pages
+OCR_DPI = int(os.environ.get("SOF_OCR_DPI", "200"))  # render DPI
+MIN_INK_RATIO = float(os.environ.get("SOF_MIN_INK_RATIO", "0.001"))  # blank page cutoff
 
-# Tesseract config for images (fallback)
-BASE_TESS_CONFIG = os.environ.get(
-    "SOF_TESS_CONFIG",
-    "--oem 1 --psm 6 -c preserve_interword_spaces=1"
+# PaddleOCR config
+OCR_LANG = os.environ.get("SOF_OCR_LANG", "en")
+
+# Instantiate PaddleOCR once (CPU only)
+# This will download models on first run (Render outbound is allowed).
+paddle_ocr = PaddleOCR(
+    use_angle_cls=True,
+    lang=OCR_LANG,
+    use_gpu=False,
+    show_log=False,
 )
-TESSERACT_TIMEOUT = int(os.environ.get("SOF_TESS_TIMEOUT", "0"))  # 0 = no per-call timeout
-
-# OCRmyPDF options
-OCR_LANG = os.environ.get("SOF_OCR_LANG", "eng")
-OCR_JOBS = int(os.environ.get("SOF_OCR_JOBS", "2"))
 
 
 # ---------------------------------------------------------------------------
-# Time / date extraction helpers
+# Time / date helpers
 # ---------------------------------------------------------------------------
 
 def _sanitize_time(val: Optional[str]) -> Optional[str]:
@@ -113,303 +115,153 @@ def extract_times_and_dates(text: str) -> Tuple[List[str], List[str]]:
 
 
 # ---------------------------------------------------------------------------
-# Text-layer extraction (from OCR’d PDF)
+# Simple ink / blank-page heuristic
 # ---------------------------------------------------------------------------
 
-def extract_text_layer_events_and_boxes(page: fitz.Page) -> Tuple[List[Dict], List[Dict]]:
+def compute_nonwhite_ratio(img: Image.Image) -> float:
     """
-    Read a page's text layer (rawdict) and turn lines into events + boxes.
-    Assumes the PDF has already been OCR'd (e.g., by OCRmyPDF).
+    img: grayscale or RGB PIL image.
+    Returns fraction of non-white-ish pixels, used to skip blanks.
+    """
+    if img.mode != "L":
+        gray = img.convert("L")
+    else:
+        gray = img
+    hist = gray.histogram()
+    if not hist:
+        return 0.0
+    total = sum(hist)
+    white = hist[-1] if len(hist) >= 256 else 0
+    non_white = total - white
+    return non_white / float(total or 1)
+
+
+# ---------------------------------------------------------------------------
+# Core PaddleOCR wrapper
+# ---------------------------------------------------------------------------
+
+def paddle_ocr_page(img: Image.Image, page_index: int) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Run PaddleOCR on a single page image and convert results into events + boxes.
     """
     events: List[Dict] = []
     boxes: List[Dict] = []
 
-    try:
-        raw = page.get_text("rawdict") or {}
-    except Exception:
+    # PaddleOCR works with numpy arrays (H, W, 3) BGR/RGB.
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    img_np = np.array(img)
+
+    result = paddle_ocr.ocr(img_np, cls=True)
+
+    # result is a list of [ [ (box, (text, score)), ... ] ] per image
+    # We'll take the first image's results (we pass one page at a time)
+    if not result or not result[0]:
         return events, boxes
 
-    line_counter = 0
-    blocks = raw.get("blocks", [])
-    for block in blocks:
-        if block.get("type") != 0:  # text blocks only
-            continue
-        for line in block.get("lines", []):
-            spans = line.get("spans", [])
-            text = " ".join(span.get("text", "") for span in spans).strip()
-            if not text:
-                continue
-
-            times, dates = extract_times_and_dates(text)
-            start = times[0] if times else None
-            end = times[1] if len(times) > 1 else None
-            x1, y1, x2, y2 = line.get("bbox", (0, 0, 0, 0))
-            bbox = {"x": x1, "y": y1, "width": x2 - x1, "height": y2 - y1}
-
-            line_counter += 1
-            ev = {
-                "event": text,
-                "notes": text,
-                "start": start,
-                "end": end,
-                "dates": list(dict.fromkeys(dates)),
-                "page": page.number + 1,
-                "line": line_counter,
-                "confidence": 0.99,
-                "bbox": bbox,
-            }
-            events.append(ev)
-            boxes.append(
-                {
-                    "page": ev["page"],
-                    "line": ev["line"],
-                    "text": text,
-                    "bbox": bbox,
-                    "confidence": ev["confidence"],
-                }
-            )
-
-    return events, boxes
-
-
-# ---------------------------------------------------------------------------
-# Image OCR helpers (for non-PDF uploads)
-# ---------------------------------------------------------------------------
-
-def parse_line_groups(ocr: Dict) -> List[Dict]:
-    grouped: Dict[Tuple[int, int, int], List[int]] = {}
-    n = len(ocr["text"])
-    for i in range(n):
-        text = ocr["text"][i]
-        if not text or text.strip() == "":
-            continue
-        key = (ocr["block_num"][i], ocr["par_num"][i], ocr["line_num"][i])
-        grouped.setdefault(key, []).append(i)
-
+    # Sort by vertical position to get a stable line order
     lines = []
-    for (b, p, l), idxs in grouped.items():
-        idxs = sorted(idxs)
-        words = []
-        x1 = y1 = 10**9
-        x2 = y2 = -10**9
-        confs = []
-        for i in idxs:
-            words.append(ocr["text"][i])
-            x, y, w, h = ocr["left"][i], ocr["top"][i], ocr["width"][i], ocr["height"][i]
-            x1 = min(x1, x)
-            y1 = min(y1, y)
-            x2 = max(x2, x + w)
-            y2 = max(y2, y + h)
-            try:
-                c = float(ocr["conf"][i])
-                if c >= 0:
-                    confs.append(c)
-            except Exception:
-                pass
-        text = " ".join(words).strip()
+    for line in result[0]:
+        box, (txt, score) = line
+        # box: 4 points [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
+        xs = [p[0] for p in box]
+        ys = [p[1] for p in box]
+        x1, x2 = min(xs), max(xs)
+        y1, y2 = min(ys), max(ys)
+        y_center = (y1 + y2) / 2.0
+        lines.append({
+            "text": txt.strip(),
+            "score": float(score),
+            "bbox": {"x": float(x1), "y": float(y1), "width": float(x2 - x1), "height": float(y2 - y1)},
+            "y_center": float(y_center),
+        })
+
+    lines.sort(key=lambda l: l["y_center"])
+
+    events_out: List[Dict] = []
+    boxes_out: List[Dict] = []
+
+    for idx, line in enumerate(lines, start=1):
+        text = line["text"]
         if not text:
             continue
-        bbox = {"x": x1, "y": y1, "width": x2 - x1, "height": y2 - y1}
-        avg_conf = sum(confs) / len(confs) if confs else None
-        lines.append(
+        times, dates = extract_times_and_dates(text)
+        start = times[0] if len(times) >= 1 else None
+        end = times[1] if len(times) >= 2 else None
+
+        ev = {
+            "event": text,
+            "notes": text,
+            "start": start,
+            "end": end,
+            "dates": list(dict.fromkeys(dates)),
+            "ratePercent": None,
+            "behavior": None,
+            "page": page_index,
+            "line": idx,
+            "confidence": line["score"],
+            "bbox": line["bbox"],
+        }
+        events_out.append(ev)
+        boxes_out.append(
             {
+                "page": page_index,
+                "line": idx,
                 "text": text,
-                "bbox": bbox,
-                "confidence": (avg_conf / 100) if avg_conf is not None else None,
-                "block": b,
-                "paragraph": p,
-                "line": l,
+                "bbox": line["bbox"],
+                "confidence": line["score"],
             }
         )
-    return lines
 
-
-def ocr_images(
-    images: List[Image.Image],
-    config: str = "--oem 1 --psm 6",
-    base_page_index: int = 1,
-) -> Tuple[List[Dict], List[Dict]]:
-    events: List[Dict] = []
-    boxes: List[Dict] = []
-    seen_lines = set()
-
-    for offset, img in enumerate(images):
-        page_idx = base_page_index + offset
-
-        kwargs = {
-            "image": img,
-            "output_type": pytesseract.Output.DICT,
-            "config": config,
-            "lang": "eng",
-        }
-        if TESSERACT_TIMEOUT > 0:
-            kwargs["timeout"] = TESSERACT_TIMEOUT
-
-        try:
-            data = pytesseract.image_to_data(**kwargs)
-        except RuntimeError as e:
-            boxes.append(
-                {
-                    "page": page_idx,
-                    "line": 0,
-                    "text": f"OCR timeout on page {page_idx}: {e}",
-                    "bbox": {"x": 0, "y": 0, "width": 0, "height": 0},
-                    "confidence": 0.0,
-                }
-            )
-            continue
-
-        lines = parse_line_groups(data)
-        for line_idx, line in enumerate(lines, start=1):
-            clean = line["text"].strip()
-            if not clean:
-                continue
-            line_key = (page_idx, clean)
-            if line_key in seen_lines:
-                continue
-            seen_lines.add(line_key)
-
-            times, dates = extract_times_and_dates(clean)
-            start = times[0] if len(times) >= 1 else None
-            end = times[1] if len(times) >= 2 else None
-
-            events.append(
-                {
-                    "event": clean,
-                    "start": start,
-                    "end": end,
-                    "dates": list(dict.fromkeys(dates)),
-                    "ratePercent": None,
-                    "behavior": None,
-                    "notes": clean,
-                    "page": page_idx,
-                    "line": line_idx,
-                    "confidence": line["confidence"],
-                    "bbox": line["bbox"],
-                }
-            )
-            boxes.append(
-                {
-                    "page": page_idx,
-                    "line": line_idx,
-                    "text": clean,
-                    "bbox": line["bbox"],
-                    "confidence": line["confidence"],
-                }
-            )
-    return events, boxes
-
-
-def preprocess_image(img: Image.Image) -> Image.Image:
-    """Lightweight preprocessing: autocontrast for images."""
-    if img.mode != "L":
-        img = img.convert("L")
-    gray = ImageOps.autocontrast(img)
-    return gray
+    return events_out, boxes_out
 
 
 # ---------------------------------------------------------------------------
-# Utility helpers
+# PDF pipeline (PyMuPDF + PaddleOCR)
 # ---------------------------------------------------------------------------
 
-def _digit_ratio(text: str) -> float:
-    if not text:
-        return 0.0
-    digits = sum(ch.isdigit() for ch in text)
-    return digits / float(len(text))
-
-
-def dedupe_events(events: List[Dict]) -> List[Dict]:
-    seen = set()
-    out: List[Dict] = []
-    for e in events:
-        key = (e.get("page"), e.get("line"), e.get("event"))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(e)
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Core: OCR PDF with OCRmyPDF, then read with PyMuPDF
-# ---------------------------------------------------------------------------
-
-def ocr_pdf_with_ocrmypdf(content: bytes) -> Tuple[List[Dict], List[Dict], List[str], int]:
-    """
-    Full pipeline for PDFs:
-
-    1) Save uploaded bytes to a temp file.
-    2) Run OCRmyPDF to produce an OCR'd PDF with text layer.
-    3) Use PyMuPDF to extract text + positions from the OCR'd PDF.
-    """
+def ocr_pdf_with_paddle(content: bytes) -> Tuple[List[Dict], List[Dict], List[str], int]:
+    start = time.monotonic()
     warnings: List[str] = []
     events: List[Dict] = []
     boxes: List[Dict] = []
 
-    start = time.monotonic()
-
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as in_tmp:
-        in_tmp.write(content)
-        in_path = in_tmp.name
-
-    out_fd, out_path = tempfile.mkstemp(suffix="-ocr.pdf")
-    os.close(out_fd)
-
-    page_count = 0
-
     try:
-        # IMPORTANT: use ONLY force_ocr=True (no skip_text / redo_ocr)
-        ocrmypdf.ocr(
-            in_path,
-            out_path,
-            language=OCR_LANG,
-            force_ocr=True,        # force OCR on all pages
-            rotate_pages=True,
-            deskew=True,
-            optimize=0,
-            jobs=OCR_JOBS,
-            progress_bar=False,
-        )
-
-        # Open the OCR'd PDF and extract text layer
-        doc = fitz.open(out_path)
-        page_count = doc.page_count
-
-        for page_idx in range(page_count):
-            page = doc.load_page(page_idx)
-            ev_page, box_page = extract_text_layer_events_and_boxes(page)
-            events.extend(ev_page)
-            boxes.extend(box_page)
-
+        doc = fitz.open(stream=content, filetype="pdf")
     except Exception as e:
-        warnings.append(f"OCRmyPDF failed: {e}")
-    finally:
-        # Clean up temp files
-        try:
-            os.remove(in_path)
-        except Exception:
-            pass
-        try:
-            os.remove(out_path)
-        except Exception:
-            pass
+        return [], [], [f"Failed to open PDF: {e}"], 0
 
-    # Basic filtering: drop pure numeric noise with no time/date and very low confidence
-    filtered_events: List[Dict] = []
-    for ev in events:
-        has_time = ev.get("start") or ev.get("end")
-        has_date = bool(ev.get("dates"))
-        if not has_time and not has_date and _digit_ratio(ev.get("event", "")) > 0.7 and ev.get("confidence", 0) < 0.4:
+    total_pages = doc.page_count
+    limit = MAX_PDF_PAGES if MAX_PDF_PAGES > 0 else total_pages
+    limit = min(limit, total_pages)
+
+    for page_idx in range(limit):
+        if time.monotonic() - start > MAX_SECONDS:
+            warnings.append(f"OCR stopped early after reaching time budget ({MAX_SECONDS}s).")
+            break
+
+        page = doc.load_page(page_idx)
+
+        # Render page to image
+        zoom = OCR_DPI / 72.0
+        mat = fitz.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        mode = "RGB" if pix.n < 4 else "RGBA"
+        img = Image.frombytes(mode, (pix.width, pix.height), pix.samples)
+        if img.mode == "RGBA":
+            img = img.convert("RGB")
+
+        # Skip near-blank pages
+        if compute_nonwhite_ratio(img) < MIN_INK_RATIO:
+            warnings.append(f"Page {page_idx + 1} skipped (looks blank).")
             continue
-        filtered_events.append(ev)
-    events = dedupe_events(filtered_events)
 
-    elapsed = time.monotonic() - start
-    if elapsed > MAX_SECONDS:
-        warnings.append(f"Warning: OCR pipeline took {elapsed:.1f}s which exceeds configured MAX_SECONDS={MAX_SECONDS}s.")
+        page_events, page_boxes = paddle_ocr_page(img, page_index=page_idx + 1)
+        events.extend(page_events)
+        boxes.extend(page_boxes)
 
-    return events, boxes, warnings, page_count
+    doc.close()
+    return events, boxes, warnings, total_pages
 
 
 # ---------------------------------------------------------------------------
@@ -419,8 +271,8 @@ def ocr_pdf_with_ocrmypdf(content: bytes) -> Tuple[List[Dict], List[Dict], List[
 @app.post("/extract")
 async def extract(file: UploadFile = File(...)):
     req_start = time.monotonic()
-
     content = await file.read()
+
     if not content:
         raise HTTPException(status_code=400, detail="Empty file")
 
@@ -434,17 +286,20 @@ async def extract(file: UploadFile = File(...)):
     is_pdf = filename.endswith(".pdf")
 
     if is_pdf:
-        # Main path: OCRmyPDF + PyMuPDF text extraction
-        events, boxes, ocr_warnings, page_count = ocr_pdf_with_ocrmypdf(content)
+        events, boxes, ocr_warnings, page_count = ocr_pdf_with_paddle(content)
     else:
-        # Fallback for image files
+        # Treat as a single image
         try:
-            pil_img = Image.open(io.BytesIO(content))
+            img = Image.open(io.BytesIO(content))
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Failed to load image: {e}") from e
-        pre = preprocess_image(pil_img)
-        events, boxes = ocr_images([pre], config=BASE_TESS_CONFIG, base_page_index=1)
-        ocr_warnings = []
+
+        if compute_nonwhite_ratio(img) < MIN_INK_RATIO:
+            ocr_warnings = ["Image looks blank."]
+            events, boxes = [], []
+        else:
+            events, boxes = paddle_ocr_page(img, page_index=1)
+            ocr_warnings = []
         page_count = 1
 
     duration_ms = int((time.monotonic() - req_start) * 1000)
@@ -458,6 +313,7 @@ async def extract(file: UploadFile = File(...)):
                 "sourcePages": page_count,
                 "durationMs": duration_ms,
                 "maxSeconds": MAX_SECONDS,
+                "ocrDpi": OCR_DPI,
             },
         }
     )
