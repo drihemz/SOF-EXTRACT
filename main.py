@@ -2,6 +2,7 @@ import io
 import os
 import re
 import time
+import tempfile
 from typing import Dict, List, Optional, Tuple
 
 import fitz  # PyMuPDF
@@ -10,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from PIL import Image, ImageOps
 import pytesseract
+import ocrmypdf
 
 app = FastAPI()
 
@@ -30,30 +32,23 @@ TIME_REGEX = re.compile(r"(\d{1,2}[:h\.]\d{2})", re.IGNORECASE)
 DATE_REGEX = re.compile(r"(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})")
 
 # ---------------------------------------------------------------------------
-# Tunables (env) – keep these simple to start
+# Tunables (env)
 # ---------------------------------------------------------------------------
 
-# SOF_MAX_PDF_PAGES=0 → process all pages
-MAX_PDF_PAGES = int(os.environ.get("SOF_MAX_PDF_PAGES", "0"))
-
-# Render at moderate DPI – good trade-off for your SOFs
-BASE_DPI = int(os.environ.get("SOF_OCR_DPI", "180"))
-
-# Guards
 MAX_FILE_BYTES = int(os.environ.get("SOF_MAX_FILE_BYTES", str(40 * 1024 * 1024)))  # 40MB guard
-MAX_SECONDS = int(os.environ.get("SOF_MAX_SECONDS", "240"))  # file-level soft guard
+MIN_TEXT_CHARS = int(os.environ.get("SOF_MIN_TEXT_CHARS", "80"))  # text-rich threshold
+MAX_SECONDS = int(os.environ.get("SOF_MAX_SECONDS", "300"))  # global soft guard
 
-# treat page as text-rich if text layer has at least this many chars
-MIN_TEXT_CHARS = int(os.environ.get("SOF_MIN_TEXT_CHARS", "150"))
-
-# Tesseract config; psm 6 works well for these SOFs
+# Tesseract config for images
 BASE_TESS_CONFIG = os.environ.get(
     "SOF_TESS_CONFIG",
     "--oem 1 --psm 6 -c preserve_interword_spaces=1"
 )
+TESSERACT_TIMEOUT = int(os.environ.get("SOF_TESS_TIMEOUT", "0"))  # 0 = no per-call timeout
 
-# No per-call Tesseract timeout by default; rely on MAX_SECONDS instead
-TESSERACT_TIMEOUT = int(os.environ.get("SOF_TESS_TIMEOUT", "0"))  # 0 = no timeout
+# OCRmyPDF options
+OCR_LANG = os.environ.get("SOF_OCR_LANG", "eng")
+OCR_JOBS = int(os.environ.get("SOF_OCR_JOBS", "2"))
 
 
 # ---------------------------------------------------------------------------
@@ -118,19 +113,24 @@ def extract_times_and_dates(text: str) -> Tuple[List[str], List[str]]:
 
 
 # ---------------------------------------------------------------------------
-# Text-layer extraction (for digital PDFs)
+# Text-layer extraction (from OCRmyPDF output)
 # ---------------------------------------------------------------------------
 
-def extract_text_layer_events(page: fitz.Page) -> List[Dict]:
-    """Use the PDF text layer when present to avoid OCR cost and noise."""
+def extract_text_layer_events_and_boxes(page: fitz.Page) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Read a page's text layer (rawdict) and turn lines into events + boxes.
+    Assumes the PDF has already been OCR'd (e.g., by OCRmyPDF).
+    """
     events: List[Dict] = []
+    boxes: List[Dict] = []
+
     try:
         raw = page.get_text("rawdict") or {}
     except Exception:
-        return events
+        return events, boxes
 
-    blocks = raw.get("blocks", [])
     line_counter = 0
+    blocks = raw.get("blocks", [])
     for block in blocks:
         if block.get("type") != 0:  # text blocks only
             continue
@@ -139,30 +139,41 @@ def extract_text_layer_events(page: fitz.Page) -> List[Dict]:
             text = " ".join(span.get("text", "") for span in spans).strip()
             if not text:
                 continue
+
             times, dates = extract_times_and_dates(text)
             start = times[0] if times else None
             end = times[1] if len(times) > 1 else None
             x1, y1, x2, y2 = line.get("bbox", (0, 0, 0, 0))
             bbox = {"x": x1, "y": y1, "width": x2 - x1, "height": y2 - y1}
+
             line_counter += 1
-            events.append(
+            ev = {
+                "event": text,
+                "notes": text,
+                "start": start,
+                "end": end,
+                "dates": list(dict.fromkeys(dates)),
+                "page": page.number + 1,
+                "line": line_counter,
+                "confidence": 0.99,  # OCRmyPDF/Tesseract doesn't give per-token conf here
+                "bbox": bbox,
+            }
+            events.append(ev)
+            boxes.append(
                 {
-                    "event": text,
-                    "notes": text,
-                    "start": start,
-                    "end": end,
-                    "dates": list(dict.fromkeys(dates)),
-                    "page": page.number + 1,
-                    "line": line_counter,
-                    "confidence": 0.99,
+                    "page": ev["page"],
+                    "line": ev["line"],
+                    "text": text,
                     "bbox": bbox,
+                    "confidence": ev["confidence"],
                 }
             )
-    return events
+
+    return events, boxes
 
 
 # ---------------------------------------------------------------------------
-# OCR helpers
+# Image OCR helpers (for non-PDF uploads)
 # ---------------------------------------------------------------------------
 
 def parse_line_groups(ocr: Dict) -> List[Dict]:
@@ -225,7 +236,6 @@ def ocr_images(
     for offset, img in enumerate(images):
         page_idx = base_page_index + offset
 
-        # Build kwargs for pytesseract; only use timeout if >0
         kwargs = {
             "image": img,
             "output_type": pytesseract.Output.DICT,
@@ -238,7 +248,6 @@ def ocr_images(
         try:
             data = pytesseract.image_to_data(**kwargs)
         except RuntimeError as e:
-            # Tesseract hung / exceeded timeout
             boxes.append(
                 {
                     "page": page_idx,
@@ -255,7 +264,6 @@ def ocr_images(
             clean = line["text"].strip()
             if not clean:
                 continue
-            # Avoid duplicate lines within the same page batch
             line_key = (page_idx, clean)
             if line_key in seen_lines:
                 continue
@@ -292,80 +300,17 @@ def ocr_images(
     return events, boxes
 
 
-# ---------------------------------------------------------------------------
-# Rendering / preprocessing
-# ---------------------------------------------------------------------------
-
-def render_page_to_pil(page: fitz.Page, dpi: int) -> Image.Image:
-    """Render a single PyMuPDF page to a grayscale PIL image."""
-    zoom = dpi / 72.0
-    mat = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat, alpha=False)
-    img = Image.frombytes("L", (pix.width, pix.height), pix.samples)
-
-    # Safety: downscale if dimensions are huge, to keep OCR cheap
-    max_side = 2200
-    w, h = img.size
-    if max(w, h) > max_side:
-        scale = max_side / float(max(w, h))
-        new_size = (int(w * scale), int(h * scale))
-        img = img.resize(new_size, Image.BILINEAR)
-    return img
-
-
 def preprocess_image(img: Image.Image) -> Image.Image:
-    """Lightweight preprocessing: autocontrast + slight threshold on grayscale image."""
+    """Lightweight preprocessing: autocontrast for images."""
+    if img.mode != "L":
+        img = img.convert("L")
     gray = ImageOps.autocontrast(img)
-    # Light threshold to clean background while keeping text
-    thresh = gray.point(lambda p: 255 if p > 200 else p)
-    return thresh
-
-
-def compute_nonwhite_ratio(gray: Image.Image) -> float:
-    """Estimate how much ink is on the page; used to skip blanks quickly."""
-    hist = gray.histogram()
-    if not hist:
-        return 0.0
-    total = sum(hist)
-    white = hist[-1] if len(hist) >= 256 else 0
-    non_white = total - white
-    return non_white / float(total or 1)
-
-
-def crop_to_content(gray: Image.Image, margin: int = 10) -> Image.Image:
-    """
-    Crop away large white margins based on non-white pixels.
-    Uses only PIL, no numpy.
-    """
-    # Turn near-white to white, everything else to black
-    bw = gray.point(lambda p: 0 if p > 245 else 255, mode="1")
-    bbox = bw.getbbox()
-    if not bbox:
-        return gray
-    x1, y1, x2, y2 = bbox
-    x1 = max(0, x1 - margin)
-    y1 = max(0, y1 - margin)
-    x2 = min(gray.width, x2 + margin)
-    y2 = min(gray.height, y2 + margin)
-    return gray.crop((x1, y1, x2, y2))
+    return gray
 
 
 # ---------------------------------------------------------------------------
-# Misc helpers
+# Utility helpers
 # ---------------------------------------------------------------------------
-
-def average_confidence(events: List[Dict]) -> float:
-    vals = [e.get("confidence") for e in events if e.get("confidence") is not None]
-    if not vals:
-        return 0.0
-    return float(sum(vals) / len(vals))
-
-
-def mark_low_quality_events(events: List[Dict], threshold: float = 0.5):
-    for ev in events:
-        conf = ev.get("confidence")
-        ev["quality"] = "low" if conf is not None and conf < threshold else "ok"
-
 
 def _digit_ratio(text: str) -> float:
     if not text:
@@ -387,98 +332,85 @@ def dedupe_events(events: List[Dict]) -> List[Dict]:
 
 
 # ---------------------------------------------------------------------------
-# Core PDF OCR pipeline (simple + robust)
+# Core: OCR PDF with OCRmyPDF, then read with PyMuPDF
 # ---------------------------------------------------------------------------
 
-def ocr_pdf_in_batches(
-    content: bytes,
-    max_pages: int,
-    tess_cfg: str,
-    time_budget: int,
-) -> Tuple[List[Dict], List[Dict], List[str], int]:
+def ocr_pdf_with_ocrmypdf(content: bytes) -> Tuple[List[Dict], List[Dict], List[str], int]:
     """
-    Process PDF pages one by one with a time budget.
+    Full pipeline for PDFs:
 
-    Strategy:
-    - Use text layer when present (skip OCR on text-rich pages).
-    - Skip clearly blank pages.
-    - Single OCR pass per page (no dense retries).
-    - Crop to content to avoid OCRing huge white margins.
+    1) Save uploaded bytes to a temp file.
+    2) Run OCRmyPDF to produce an OCR'd PDF with text layer.
+    3) Use PyMuPDF to extract text + positions from the OCR'd PDF.
     """
-    start_time = time.monotonic()
+    warnings: List[str] = []
     events: List[Dict] = []
     boxes: List[Dict] = []
-    warnings: List[str] = []
+
+    start = time.monotonic()
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as in_tmp:
+        in_tmp.write(content)
+        in_path = in_tmp.name
+
+    out_fd, out_path = tempfile.mkstemp(suffix="-ocr.pdf")
+    os.close(out_fd)
 
     try:
-        doc = fitz.open(stream=content, filetype="pdf")
-        total_pages = doc.page_count
-    except Exception:
-        return [], [], ["Failed to open PDF for OCR"], 0
-
-    limit = max_pages if max_pages > 0 else total_pages
-    limit = min(limit, total_pages)
-
-    for page_idx in range(limit):
-        elapsed = time.monotonic() - start_time
-        if elapsed > time_budget:
-            warnings.append(f"OCR stopped early after reaching time budget ({time_budget}s).")
-            break
-
-        page = doc.load_page(page_idx)
-
-        # Fast path: rich text layer available
-        try:
-            text_preview = page.get_text("text") or ""
-        except Exception:
-            text_preview = ""
-        if len(text_preview) >= MIN_TEXT_CHARS:
-            text_events = extract_text_layer_events(page)
-            events.extend(text_events)
-            continue
-
-        # Render & preprocess
-        img = render_page_to_pil(page, dpi=BASE_DPI)
-        gray = preprocess_image(img)
-
-        # Skip pages that are essentially blank
-        if compute_nonwhite_ratio(gray) < 0.001:
-            warnings.append(f"Page {page_idx + 1} skipped (looks blank).")
-            continue
-
-        # Crop to content region to avoid huge white borders
-        cropped = crop_to_content(gray)
-
-        # Single OCR pass on cropped region
-        ev_batch, box_batch = ocr_images(
-            [cropped],
-            config=tess_cfg,
-            base_page_index=page_idx + 1,
+        # Run OCRmyPDF: force OCR on image pages, skip pages that already have text,
+        # deskew and rotate, no heavy optimization to keep speed reasonable.
+        ocrmypdf.ocr(
+            in_path,
+            out_path,
+            language=OCR_LANG,
+            force_ocr=True,
+            skip_text=True,
+            rotate_pages=True,
+            deskew=True,
+            optimize=0,
+            jobs=OCR_JOBS,
+            progress_bar=False,
         )
-        conf_avg = average_confidence(ev_batch)
-        mark_low_quality_events(ev_batch, threshold=0.5)
 
-        # Attach page index metadata (override any local indexing)
-        for ev in ev_batch:
-            ev["page"] = page_idx + 1
-        for b in box_batch:
-            b["page"] = page_idx + 1
+        # Open the OCR'd PDF and extract text layer
+        doc = fitz.open(out_path)
+        page_count = doc.page_count
 
-        # Filter out obvious noise-only lines (numeric blobs without time/date)
-        filtered_events = []
-        for ev in ev_batch:
-            has_time = ev.get("start") or ev.get("end")
-            has_date = bool(ev.get("dates"))
-            if not has_time and not has_date and _digit_ratio(ev.get("event", "")) > 0.7 and ev.get("confidence", 0) < 0.55:
-                continue
-            filtered_events.append(ev)
-        ev_batch = filtered_events
+        for page_idx in range(page_count):
+            page = doc.load_page(page_idx)
+            ev_page, box_page = extract_text_layer_events_and_boxes(page)
+            events.extend(ev_page)
+            boxes.extend(box_page)
 
-        events.extend(ev_batch)
-        boxes.extend(box_batch)
+    except Exception as e:
+        warnings.append(f"OCRmyPDF failed: {e}")
+        page_count = 0
+    finally:
+        # Clean up temp files
+        try:
+            os.remove(in_path)
+        except Exception:
+            pass
+        try:
+            os.remove(out_path)
+        except Exception:
+            pass
 
-    events = dedupe_events(events)
-    return events, boxes, warnings, total_pages
+    # Basic filtering: drop pure numeric noise with no time/date and very low confidence
+    filtered_events: List[Dict] = []
+    for ev in events:
+        has_time = ev.get("start") or ev.get("end")
+        has_date = bool(ev.get("dates"))
+        if not has_time and not has_date and _digit_ratio(ev.get("event", "")) > 0.7 and ev.get("confidence", 0) < 0.4:
+            continue
+        filtered_events.append(ev)
+    events = dedupe_events(filtered_events)
+
+    elapsed = time.monotonic() - start
+    if elapsed > MAX_SECONDS:
+        warnings.append(f"Warning: OCR pipeline took {elapsed:.1f}s which exceeds configured MAX_SECONDS={MAX_SECONDS}s.")
+
+    return events, boxes, warnings, page_count
 
 
 # ---------------------------------------------------------------------------
@@ -488,11 +420,10 @@ def ocr_pdf_in_batches(
 @app.post("/extract")
 async def extract(file: UploadFile = File(...)):
     req_start = time.monotonic()
+
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="Empty file")
-
-    is_pdf = file.filename.lower().endswith(".pdf")
 
     if len(content) > MAX_FILE_BYTES:
         raise HTTPException(
@@ -500,22 +431,20 @@ async def extract(file: UploadFile = File(...)):
             detail=f"File too large for OCR (>{MAX_FILE_BYTES // (1024*1024)} MB). Please trim pages or reduce size.",
         )
 
+    filename = (file.filename or "").lower()
+    is_pdf = filename.endswith(".pdf")
+
     if is_pdf:
-        events, boxes, ocr_warnings, page_count = ocr_pdf_in_batches(
-            content,
-            max_pages=MAX_PDF_PAGES if MAX_PDF_PAGES > 0 else 0,
-            tess_cfg=BASE_TESS_CONFIG,
-            time_budget=MAX_SECONDS,
-        )
+        # Main path: OCRmyPDF + PyMuPDF text extraction
+        events, boxes, ocr_warnings, page_count = ocr_pdf_with_ocrmypdf(content)
     else:
-        # Image input
+        # Fallback for image files
         try:
-            pil_img = Image.open(io.BytesIO(content)).convert("L")
+            pil_img = Image.open(io.BytesIO(content))
         except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to load file: {e}") from e
+            raise HTTPException(status_code=400, detail=f"Failed to load image: {e}") from e
         pre = preprocess_image(pil_img)
-        cropped = crop_to_content(pre)
-        events, boxes = ocr_images([cropped], config=BASE_TESS_CONFIG, base_page_index=1)
+        events, boxes = ocr_images([pre], config=BASE_TESS_CONFIG, base_page_index=1)
         ocr_warnings = []
         page_count = 1
 
@@ -530,7 +459,6 @@ async def extract(file: UploadFile = File(...)):
                 "sourcePages": page_count,
                 "durationMs": duration_ms,
                 "maxSeconds": MAX_SECONDS,
-                "ocrDpi": BASE_DPI,
             },
         }
     )
