@@ -304,8 +304,6 @@ OCR_ENGINE = PaddleOCR(
     use_angle_cls=True,
     lang=PADDLE_LANG,
     show_log=False,
-    rec=True,
-    det=True,
 )
 
 
