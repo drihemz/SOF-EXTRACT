@@ -29,15 +29,15 @@ DATE_REGEX = re.compile(r"(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})")
 # Set SOF_MAX_PDF_PAGES=0 (default) to process all pages. Set a positive number to cap for performance if desired.
 MAX_PDF_PAGES = int(os.environ.get("SOF_MAX_PDF_PAGES", "0"))
 PREVIEW_DPI = int(os.environ.get("SOF_PREVIEW_DPI", "96"))  # low-DPI preview for cheap blank detection
-BASE_DPI = int(os.environ.get("SOF_OCR_DPI", "190"))  # default raster DPI for OCR (conservative)
+BASE_DPI = int(os.environ.get("SOF_OCR_DPI", "150"))  # default raster DPI for OCR (conservative, smaller)
 DENSE_DPI = int(os.environ.get("SOF_OCR_DENSE_DPI", "240"))  # kept for compatibility; dense pass disabled in fast path
 MAX_FILE_BYTES = int(os.environ.get("SOF_MAX_FILE_BYTES", str(40 * 1024 * 1024)))  # 40MB guard
-MAX_SECONDS = int(os.environ.get("SOF_MAX_SECONDS", "180"))  # keep under proxy timeout
-PER_PAGE_SECONDS = int(os.environ.get("SOF_PAGE_SECONDS", "30"))  # hard ceiling per page to avoid tail spikes
+MAX_SECONDS = int(os.environ.get("SOF_MAX_SECONDS", "260"))  # keep under proxy timeout
+PER_PAGE_SECONDS = int(os.environ.get("SOF_PAGE_SECONDS", "40"))  # hard ceiling per page to avoid tail spikes
 MIN_TEXT_CHARS = int(os.environ.get("SOF_MIN_TEXT_CHARS", "120"))  # treat page as text-rich above this
 BASE_TESS_CONFIG = os.environ.get("SOF_TESS_CONFIG", "--oem 1 --psm 6 -c preserve_interword_spaces=1")
 DENSE_TESS_CONFIG = os.environ.get("SOF_TESS_CONFIG_DENSE", "--oem 1 --psm 4 -c preserve_interword_spaces=1")
-TESSERACT_TIMEOUT = int(os.environ.get("SOF_TESS_TIMEOUT", "10"))  # per-call Tesseract timeout in seconds
+TESSERACT_TIMEOUT = int(os.environ.get("SOF_TESS_TIMEOUT", "25"))  # per-call Tesseract timeout in seconds
 
 
 def _sanitize_time(val: Optional[str]) -> Optional[str]:
@@ -263,14 +263,19 @@ def ocr_images(images: List[Image.Image], config: str = "--oem 1 --psm 6", base_
 
 
 def render_page_to_pil(page: fitz.Page, dpi: int) -> Image.Image:
-    """Render a single PyMuPDF page to a PIL image."""
+    """Render a single PyMuPDF page to a grayscale PIL image, downscaled if huge."""
     zoom = dpi / 72
     mat = fitz.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=mat, alpha=False)
-    mode = "RGB" if pix.n < 4 else "RGBA"
-    img = Image.frombytes(mode, (pix.width, pix.height), pix.samples)
-    if img.mode != "RGB":
-        img = img.convert("RGB")
+    img = Image.frombytes("L", (pix.width, pix.height), pix.samples)
+
+    # Safety: downscale if dimensions are excessively large to keep OCR cheap
+    max_side = 1800
+    w, h = img.size
+    if max(w, h) > max_side:
+        scale = max_side / float(max(w, h))
+        new_size = (int(w * scale), int(h * scale))
+        img = img.resize(new_size, Image.BILINEAR)
     return img
 
 
@@ -283,9 +288,8 @@ def render_preview_gray(page: fitz.Page, dpi: int) -> Image.Image:
 
 
 def preprocess_image(img: Image.Image) -> Image.Image:
-    """Lightweight preprocessing: grayscale + autocontrast + slight threshold."""
-    gray = img.convert("L")
-    gray = ImageOps.autocontrast(gray)
+    """Lightweight preprocessing: autocontrast + slight threshold on grayscale image."""
+    gray = ImageOps.autocontrast(img)
     # Light threshold to clean background while keeping text
     thresh = gray.point(lambda p: 255 if p > 200 else p)
     return thresh
@@ -388,7 +392,7 @@ def ocr_pdf_in_batches(content: bytes, max_pages: int, tess_cfg: str, dense_cfg:
 
         # Cheap preview to skip blanks
         preview_gray = render_preview_gray(page, dpi=PREVIEW_DPI)
-        if compute_nonwhite_ratio(preview_gray) < 0.003:
+        if compute_nonwhite_ratio(preview_gray) < 0.002:
             warnings.append(f"Page {page_idx + 1} skipped (looks blank on preview).")
             continue
 
