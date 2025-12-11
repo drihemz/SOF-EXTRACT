@@ -303,7 +303,6 @@ def dedupe_events(events: List[Dict]) -> List[Dict]:
 OCR_ENGINE = PaddleOCR(
     use_angle_cls=True,
     lang=PADDLE_LANG,
-    show_log=False,
 )
 
 
