@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.10-slim
 
 # System deps: poppler for pdf2image, plus minimal libs for PaddleOCR (CPU)
 RUN apt-get update && apt-get install -y \
