@@ -306,8 +306,6 @@ OCR_ENGINE = PaddleOCR(
     show_log=False,
     rec=True,
     det=True,
-    use_gpu=False,
-    cpu_threads=PADDLE_REC_THREADS,
 )
 
 
