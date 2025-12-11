@@ -38,6 +38,9 @@ PER_PAGE_SECONDS = int(os.environ.get("SOF_PAGE_SECONDS", "40"))  # hard ceiling
 MIN_TEXT_CHARS = int(os.environ.get("SOF_MIN_TEXT_CHARS", "120"))  # treat page as text-rich above this
 PADDLE_LANG = os.environ.get("SOF_PADDLE_LANG", "en")
 PADDLE_REC_THREADS = int(os.environ.get("SOF_PADDLE_THREADS", "4"))
+# Legacy placeholders for backward compatibility (not used with PaddleOCR)
+BASE_TESS_CONFIG = os.environ.get("SOF_TESS_CONFIG", "")
+DENSE_TESS_CONFIG = os.environ.get("SOF_TESS_CONFIG_DENSE", "")
 
 
 def _sanitize_time(val: Optional[str]) -> Optional[str]:
