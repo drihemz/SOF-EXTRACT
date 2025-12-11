@@ -10,7 +10,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from PIL import Image, ImageOps
 import pytesseract
-import numpy as np
 
 app = FastAPI()
 
@@ -23,26 +22,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Regex for time / date extraction ----------------------------------------
+# ---------------------------------------------------------------------------
+# Regex for time / date extraction
+# ---------------------------------------------------------------------------
 
 TIME_REGEX = re.compile(r"(\d{1,2}[:h\.]\d{2})", re.IGNORECASE)
 DATE_REGEX = re.compile(r"(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})")
 
-# --- Tunables via env for performance safeguards -----------------------------
+# ---------------------------------------------------------------------------
+# Tunables (env) – keep these simple to start
+# ---------------------------------------------------------------------------
 
-# Set SOF_MAX_PDF_PAGES=0 (default) to process all pages. Set a positive number to cap for performance if desired.
+# SOF_MAX_PDF_PAGES=0 → process all pages
 MAX_PDF_PAGES = int(os.environ.get("SOF_MAX_PDF_PAGES", "0"))
 
-PREVIEW_DPI = int(os.environ.get("SOF_PREVIEW_DPI", "96"))   # low-DPI preview for cheap blank detection
-BASE_DPI = int(os.environ.get("SOF_OCR_DPI", "180"))          # default raster DPI for OCR
+# Render at moderate DPI – good trade-off for your SOFs
+BASE_DPI = int(os.environ.get("SOF_OCR_DPI", "180"))
 
+# Guards
 MAX_FILE_BYTES = int(os.environ.get("SOF_MAX_FILE_BYTES", str(40 * 1024 * 1024)))  # 40MB guard
+MAX_SECONDS = int(os.environ.get("SOF_MAX_SECONDS", "240"))  # file-level soft guard
 
-# File-level and page-level guardrails (in seconds)
-MAX_SECONDS = int(os.environ.get("SOF_MAX_SECONDS", "260"))       # keep under proxy timeout
-PER_PAGE_SECONDS = int(os.environ.get("SOF_PAGE_SECONDS", "45"))  # soft ceiling per page
-
-MIN_TEXT_CHARS = int(os.environ.get("SOF_MIN_TEXT_CHARS", "120"))  # treat page as text-rich above this
+# treat page as text-rich if text layer has at least this many chars
+MIN_TEXT_CHARS = int(os.environ.get("SOF_MIN_TEXT_CHARS", "150"))
 
 # Tesseract config; psm 6 works well for these SOFs
 BASE_TESS_CONFIG = os.environ.get(
@@ -50,12 +52,13 @@ BASE_TESS_CONFIG = os.environ.get(
     "--oem 1 --psm 6 -c preserve_interword_spaces=1"
 )
 
-# Optional per-call Tesseract timeout; 0 or negative = no timeout (we rely on MAX_SECONDS instead)
-TESSERACT_TIMEOUT = int(os.environ.get("SOF_TESS_TIMEOUT", "0"))
+# No per-call Tesseract timeout by default; rely on MAX_SECONDS instead
+TESSERACT_TIMEOUT = int(os.environ.get("SOF_TESS_TIMEOUT", "0"))  # 0 = no timeout
 
 
-# --- Helpers: time / date extraction -----------------------------------------
-
+# ---------------------------------------------------------------------------
+# Time / date extraction helpers
+# ---------------------------------------------------------------------------
 
 def _sanitize_time(val: Optional[str]) -> Optional[str]:
     if not val:
@@ -114,8 +117,9 @@ def extract_times_and_dates(text: str) -> Tuple[List[str], List[str]]:
     return unique_times, dates
 
 
-# --- Text-layer path (for digital PDFs) --------------------------------------
-
+# ---------------------------------------------------------------------------
+# Text-layer extraction (for digital PDFs)
+# ---------------------------------------------------------------------------
 
 def extract_text_layer_events(page: fitz.Page) -> List[Dict]:
     """Use the PDF text layer when present to avoid OCR cost and noise."""
@@ -157,8 +161,9 @@ def extract_text_layer_events(page: fitz.Page) -> List[Dict]:
     return events
 
 
-# --- OCR helpers -------------------------------------------------------------
-
+# ---------------------------------------------------------------------------
+# OCR helpers
+# ---------------------------------------------------------------------------
 
 def parse_line_groups(ocr: Dict) -> List[Dict]:
     grouped: Dict[Tuple[int, int, int], List[int]] = {}
@@ -287,32 +292,25 @@ def ocr_images(
     return events, boxes
 
 
-# --- Rendering / preprocessing -----------------------------------------------
-
+# ---------------------------------------------------------------------------
+# Rendering / preprocessing
+# ---------------------------------------------------------------------------
 
 def render_page_to_pil(page: fitz.Page, dpi: int) -> Image.Image:
-    """Render a single PyMuPDF page to a grayscale PIL image, downscaled if huge."""
+    """Render a single PyMuPDF page to a grayscale PIL image."""
     zoom = dpi / 72.0
     mat = fitz.Matrix(zoom, zoom)
     pix = page.get_pixmap(matrix=mat, alpha=False)
     img = Image.frombytes("L", (pix.width, pix.height), pix.samples)
 
-    # Safety: downscale if dimensions are excessively large to keep OCR cheap
-    max_side = 2000
+    # Safety: downscale if dimensions are huge, to keep OCR cheap
+    max_side = 2200
     w, h = img.size
     if max(w, h) > max_side:
         scale = max_side / float(max(w, h))
         new_size = (int(w * scale), int(h * scale))
         img = img.resize(new_size, Image.BILINEAR)
     return img
-
-
-def render_preview_gray(page: fitz.Page, dpi: int) -> Image.Image:
-    """Low-DPI grayscale render for cheap blank detection."""
-    zoom = dpi / 72.0
-    mat = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat, alpha=False)
-    return Image.frombytes("L", (pix.width, pix.height), pix.samples)
 
 
 def preprocess_image(img: Image.Image) -> Image.Image:
@@ -337,26 +335,24 @@ def compute_nonwhite_ratio(gray: Image.Image) -> float:
 def crop_to_content(gray: Image.Image, margin: int = 10) -> Image.Image:
     """
     Crop away large white margins based on non-white pixels.
-    This dramatically reduces OCR work on scanned SOFs with big borders.
+    Uses only PIL, no numpy.
     """
-    arr = np.array(gray)
-    # Consider anything darker than very light gray as "ink"
-    mask = arr < 245
-    if not mask.any():
-        # Page is essentially empty or extremely faint
+    # Turn near-white to white, everything else to black
+    bw = gray.point(lambda p: 0 if p > 245 else 255, mode="1")
+    bbox = bw.getbbox()
+    if not bbox:
         return gray
-    ys, xs = np.where(mask)
-    y1, y2 = int(ys.min()), int(ys.max())
-    x1, x2 = int(xs.min()), int(xs.max())
-    x1 = max(x1 - margin, 0)
-    y1 = max(y1 - margin, 0)
-    x2 = min(x2 + margin, gray.width - 1)
-    y2 = min(y2 + margin, gray.height - 1)
+    x1, y1, x2, y2 = bbox
+    x1 = max(0, x1 - margin)
+    y1 = max(0, y1 - margin)
+    x2 = min(gray.width, x2 + margin)
+    y2 = min(gray.height, y2 + margin)
     return gray.crop((x1, y1, x2, y2))
 
 
-# --- Misc helpers ------------------------------------------------------------
-
+# ---------------------------------------------------------------------------
+# Misc helpers
+# ---------------------------------------------------------------------------
 
 def average_confidence(events: List[Dict]) -> float:
     vals = [e.get("confidence") for e in events if e.get("confidence") is not None]
@@ -390,8 +386,9 @@ def dedupe_events(events: List[Dict]) -> List[Dict]:
     return out
 
 
-# --- Core PDF OCR pipeline ---------------------------------------------------
-
+# ---------------------------------------------------------------------------
+# Core PDF OCR pipeline (simple + robust)
+# ---------------------------------------------------------------------------
 
 def ocr_pdf_in_batches(
     content: bytes,
@@ -400,12 +397,12 @@ def ocr_pdf_in_batches(
     time_budget: int,
 ) -> Tuple[List[Dict], List[Dict], List[str], int]:
     """
-    Process PDF pages one by one with a time budget; keeps all pages unless budget is hit.
+    Process PDF pages one by one with a time budget.
 
     Strategy:
     - Use text layer when present (skip OCR on text-rich pages).
-    - Skip near-blank pages based on preview.
-    - Single OCR pass per page (no high-DPI retry) to keep runtime predictable.
+    - Skip clearly blank pages.
+    - Single OCR pass per page (no dense retries).
     - Crop to content to avoid OCRing huge white margins.
     """
     start_time = time.monotonic()
@@ -428,7 +425,6 @@ def ocr_pdf_in_batches(
             warnings.append(f"OCR stopped early after reaching time budget ({time_budget}s).")
             break
 
-        page_start = time.monotonic()
         page = doc.load_page(page_idx)
 
         # Fast path: rich text layer available
@@ -441,20 +437,19 @@ def ocr_pdf_in_batches(
             events.extend(text_events)
             continue
 
-        # Cheap preview to skip blanks
-        preview_gray = render_preview_gray(page, dpi=PREVIEW_DPI)
-        if compute_nonwhite_ratio(preview_gray) < 0.0015:
-            warnings.append(f"Page {page_idx + 1} skipped (looks blank on preview).")
-            continue
-
-        # Single render at base DPI
+        # Render & preprocess
         img = render_page_to_pil(page, dpi=BASE_DPI)
         gray = preprocess_image(img)
+
+        # Skip pages that are essentially blank
+        if compute_nonwhite_ratio(gray) < 0.001:
+            warnings.append(f"Page {page_idx + 1} skipped (looks blank).")
+            continue
 
         # Crop to content region to avoid huge white borders
         cropped = crop_to_content(gray)
 
-        # Single OCR pass
+        # Single OCR pass on cropped region
         ev_batch, box_batch = ocr_images(
             [cropped],
             config=tess_cfg,
@@ -482,19 +477,13 @@ def ocr_pdf_in_batches(
         events.extend(ev_batch)
         boxes.extend(box_batch)
 
-        page_elapsed = time.monotonic() - page_start
-        if page_elapsed > PER_PAGE_SECONDS:
-            warnings.append(
-                f"Page {page_idx + 1} processing time {page_elapsed:.1f}s exceeded per-page budget "
-                f"({PER_PAGE_SECONDS}s); OCR result kept, no extra work attempted."
-            )
-
     events = dedupe_events(events)
     return events, boxes, warnings, total_pages
 
 
-# --- FastAPI endpoint --------------------------------------------------------
-
+# ---------------------------------------------------------------------------
+# FastAPI endpoint
+# ---------------------------------------------------------------------------
 
 @app.post("/extract")
 async def extract(file: UploadFile = File(...)):
@@ -511,7 +500,6 @@ async def extract(file: UploadFile = File(...)):
             detail=f"File too large for OCR (>{MAX_FILE_BYTES // (1024*1024)} MB). Please trim pages or reduce size.",
         )
 
-    # PDFs: batch OCR; images: single-pass OCR
     if is_pdf:
         events, boxes, ocr_warnings, page_count = ocr_pdf_in_batches(
             content,
@@ -520,6 +508,7 @@ async def extract(file: UploadFile = File(...)):
             time_budget=MAX_SECONDS,
         )
     else:
+        # Image input
         try:
             pil_img = Image.open(io.BytesIO(content)).convert("L")
         except Exception as e:
@@ -541,7 +530,7 @@ async def extract(file: UploadFile = File(...)):
                 "sourcePages": page_count,
                 "durationMs": duration_ms,
                 "maxSeconds": MAX_SECONDS,
-                "perPageSeconds": PER_PAGE_SECONDS,
+                "ocrDpi": BASE_DPI,
             },
         }
     )
