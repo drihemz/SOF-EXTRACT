@@ -4,6 +4,6 @@ pillow
 python-multipart
 PyMuPDF
 
-# OCR engine
-paddlepaddle==2.5.1
+# OCR engine (CPU)
+paddlepaddle==2.6.2
 paddleocr==2.7.0.3
