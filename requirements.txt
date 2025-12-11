@@ -4,6 +4,6 @@ pdf2image
 pillow
 python-multipart
 PyPDF2
-PyMuPDF
+PyMuPDF==1.23.26
 paddleocr==2.7.0
 paddlepaddle==2.6.2
