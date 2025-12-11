@@ -1,7 +1,8 @@
 FROM python:3.11-slim
 
-# System deps for OpenCV/Pillow etc.
+# System deps for Poppler (pdf2image) and OpenCV/Pillow etc.
 RUN apt-get update && apt-get install -y \
+    poppler-utils \
     libglib2.0-0 \
     libsm6 \
     libxrender1 \

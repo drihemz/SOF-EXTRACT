@@ -4,8 +4,8 @@ import re
 import time
 from typing import Dict, List, Optional, Tuple
 
-import fitz  # PyMuPDF
 import numpy as np
+from pdf2image import convert_from_bytes
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -24,7 +24,7 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
-# Regex for time / date extraction (SOF-friendly)
+# Regex for time / date extraction (SOF-style)
 # ---------------------------------------------------------------------------
 
 TIME_REGEX = re.compile(r"(\d{1,2}[:h\.]\d{2})", re.IGNORECASE)
@@ -36,15 +36,15 @@ DATE_REGEX = re.compile(r"(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})")
 
 MAX_FILE_BYTES = int(os.environ.get("SOF_MAX_FILE_BYTES", str(40 * 1024 * 1024)))  # 40MB guard
 MAX_SECONDS = int(os.environ.get("SOF_MAX_SECONDS", "260"))  # global soft guard
+
 MAX_PDF_PAGES = int(os.environ.get("SOF_MAX_PDF_PAGES", "0"))  # 0 => all pages
-OCR_DPI = int(os.environ.get("SOF_OCR_DPI", "200"))  # render DPI
+OCR_DPI = int(os.environ.get("SOF_OCR_DPI", "200"))  # render DPI for pdf2image
 MIN_INK_RATIO = float(os.environ.get("SOF_MIN_INK_RATIO", "0.001"))  # blank page cutoff
 
 # PaddleOCR config
 OCR_LANG = os.environ.get("SOF_OCR_LANG", "en")
 
 # Instantiate PaddleOCR once (CPU only)
-# This will download models on first run (Render outbound is allowed).
 paddle_ocr = PaddleOCR(
     use_angle_cls=True,
     lang=OCR_LANG,
@@ -147,23 +147,20 @@ def paddle_ocr_page(img: Image.Image, page_index: int) -> Tuple[List[Dict], List
     events: List[Dict] = []
     boxes: List[Dict] = []
 
-    # PaddleOCR works with numpy arrays (H, W, 3) BGR/RGB.
+    # PaddleOCR works with numpy arrays (H, W, 3).
     if img.mode != "RGB":
         img = img.convert("RGB")
     img_np = np.array(img)
 
     result = paddle_ocr.ocr(img_np, cls=True)
 
-    # result is a list of [ [ (box, (text, score)), ... ] ] per image
-    # We'll take the first image's results (we pass one page at a time)
     if not result or not result[0]:
         return events, boxes
 
-    # Sort by vertical position to get a stable line order
+    # sort lines by vertical position
     lines = []
     for line in result[0]:
         box, (txt, score) = line
-        # box: 4 points [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]
         xs = [p[0] for p in box]
         ys = [p[1] for p in box]
         x1, x2 = min(xs), max(xs)
@@ -177,9 +174,6 @@ def paddle_ocr_page(img: Image.Image, page_index: int) -> Tuple[List[Dict], List
         })
 
     lines.sort(key=lambda l: l["y_center"])
-
-    events_out: List[Dict] = []
-    boxes_out: List[Dict] = []
 
     for idx, line in enumerate(lines, start=1):
         text = line["text"]
@@ -202,8 +196,8 @@ def paddle_ocr_page(img: Image.Image, page_index: int) -> Tuple[List[Dict], List
             "confidence": line["score"],
             "bbox": line["bbox"],
         }
-        events_out.append(ev)
-        boxes_out.append(
+        events.append(ev)
+        boxes.append(
             {
                 "page": page_index,
                 "line": idx,
@@ -213,11 +207,11 @@ def paddle_ocr_page(img: Image.Image, page_index: int) -> Tuple[List[Dict], List
             }
         )
 
-    return events_out, boxes_out
+    return events, boxes
 
 
 # ---------------------------------------------------------------------------
-# PDF pipeline (PyMuPDF + PaddleOCR)
+# PDF pipeline (pdf2image + PaddleOCR)
 # ---------------------------------------------------------------------------
 
 def ocr_pdf_with_paddle(content: bytes) -> Tuple[List[Dict], List[Dict], List[str], int]:
@@ -226,12 +220,13 @@ def ocr_pdf_with_paddle(content: bytes) -> Tuple[List[Dict], List[Dict], List[st
     events: List[Dict] = []
     boxes: List[Dict] = []
 
+    # Render all pages to images
     try:
-        doc = fitz.open(stream=content, filetype="pdf")
+        images = convert_from_bytes(content, dpi=OCR_DPI)
     except Exception as e:
-        return [], [], [f"Failed to open PDF: {e}"], 0
+        return [], [], [f"Failed to convert PDF to images: {e}"], 0
 
-    total_pages = doc.page_count
+    total_pages = len(images)
     limit = MAX_PDF_PAGES if MAX_PDF_PAGES > 0 else total_pages
     limit = min(limit, total_pages)
 
@@ -240,16 +235,7 @@ def ocr_pdf_with_paddle(content: bytes) -> Tuple[List[Dict], List[Dict], List[st
             warnings.append(f"OCR stopped early after reaching time budget ({MAX_SECONDS}s).")
             break
 
-        page = doc.load_page(page_idx)
-
-        # Render page to image
-        zoom = OCR_DPI / 72.0
-        mat = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        mode = "RGB" if pix.n < 4 else "RGBA"
-        img = Image.frombytes(mode, (pix.width, pix.height), pix.samples)
-        if img.mode == "RGBA":
-            img = img.convert("RGB")
+        img = images[page_idx]
 
         # Skip near-blank pages
         if compute_nonwhite_ratio(img) < MIN_INK_RATIO:
@@ -260,7 +246,6 @@ def ocr_pdf_with_paddle(content: bytes) -> Tuple[List[Dict], List[Dict], List[st
         events.extend(page_events)
         boxes.extend(page_boxes)
 
-    doc.close()
     return events, boxes, warnings, total_pages
 
 
