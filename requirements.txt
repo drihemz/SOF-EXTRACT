@@ -5,5 +5,5 @@ pillow
 python-multipart
 PyPDF2
 PyMuPDF
-paddleocr
+paddleocr==2.7.0
 paddlepaddle==2.6.2
