@@ -15,7 +15,7 @@ import ocrmypdf
 
 app = FastAPI()
 
-# CORS: tighten origins to your frontend domains if needed
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -39,7 +39,7 @@ MAX_FILE_BYTES = int(os.environ.get("SOF_MAX_FILE_BYTES", str(40 * 1024 * 1024))
 MIN_TEXT_CHARS = int(os.environ.get("SOF_MIN_TEXT_CHARS", "80"))  # text-rich threshold
 MAX_SECONDS = int(os.environ.get("SOF_MAX_SECONDS", "300"))  # global soft guard
 
-# Tesseract config for images
+# Tesseract config for images (fallback)
 BASE_TESS_CONFIG = os.environ.get(
     "SOF_TESS_CONFIG",
     "--oem 1 --psm 6 -c preserve_interword_spaces=1"
@@ -113,7 +113,7 @@ def extract_times_and_dates(text: str) -> Tuple[List[str], List[str]]:
 
 
 # ---------------------------------------------------------------------------
-# Text-layer extraction (from OCRmyPDF output)
+# Text-layer extraction (from OCR’d PDF)
 # ---------------------------------------------------------------------------
 
 def extract_text_layer_events_and_boxes(page: fitz.Page) -> Tuple[List[Dict], List[Dict]]:
@@ -155,7 +155,7 @@ def extract_text_layer_events_and_boxes(page: fitz.Page) -> Tuple[List[Dict], Li
                 "dates": list(dict.fromkeys(dates)),
                 "page": page.number + 1,
                 "line": line_counter,
-                "confidence": 0.99,  # OCRmyPDF/Tesseract doesn't give per-token conf here
+                "confidence": 0.99,
                 "bbox": bbox,
             }
             events.append(ev)
@@ -356,15 +356,15 @@ def ocr_pdf_with_ocrmypdf(content: bytes) -> Tuple[List[Dict], List[Dict], List[
     out_fd, out_path = tempfile.mkstemp(suffix="-ocr.pdf")
     os.close(out_fd)
 
+    page_count = 0
+
     try:
-        # Run OCRmyPDF: force OCR on image pages, skip pages that already have text,
-        # deskew and rotate, no heavy optimization to keep speed reasonable.
+        # IMPORTANT: use ONLY force_ocr=True (no skip_text / redo_ocr)
         ocrmypdf.ocr(
             in_path,
             out_path,
             language=OCR_LANG,
-            force_ocr=True,
-            skip_text=True,
+            force_ocr=True,        # force OCR on all pages
             rotate_pages=True,
             deskew=True,
             optimize=0,
@@ -384,7 +384,6 @@ def ocr_pdf_with_ocrmypdf(content: bytes) -> Tuple[List[Dict], List[Dict], List[
 
     except Exception as e:
         warnings.append(f"OCRmyPDF failed: {e}")
-        page_count = 0
     finally:
         # Clean up temp files
         try:
