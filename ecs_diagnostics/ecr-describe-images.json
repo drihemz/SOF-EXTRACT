@@ -1,0 +1,38 @@
+{
+    "imageDetails": [
+        {
+            "registryId": "516466084656",
+            "repositoryName": "zouheir/sof-ocr",
+            "imageDigest": "sha256:971debf37a52095891aa7ed99fe9b5cafd92000a7a5480ac7a88cbd66c14955e",
+            "imageSizeInBytes": 795985816,
+            "imagePushedAt": "2025-12-11T19:41:40.572000+00:00",
+            "imageManifestMediaType": "application/vnd.oci.image.manifest.v1+json",
+            "artifactMediaType": "application/vnd.oci.image.config.v1+json",
+            "lastRecordedPullTime": "2025-12-11T19:41:40.977000+00:00",
+            "imageStatus": "ACTIVE"
+        },
+        {
+            "registryId": "516466084656",
+            "repositoryName": "zouheir/sof-ocr",
+            "imageDigest": "sha256:48ac6e0d67c8c51e2921b57fb94853a13985705f3c34a9302dbda0ab1a5d983a",
+            "imageSizeInBytes": 795985816,
+            "imagePushedAt": "2025-12-11T19:41:41.101000+00:00",
+            "imageManifestMediaType": "application/vnd.oci.image.index.v1+json",
+            "lastRecordedPullTime": "2025-12-12T02:01:49.019000+00:00",
+            "imageStatus": "ACTIVE"
+        },
+        {
+            "registryId": "516466084656",
+            "repositoryName": "zouheir/sof-ocr",
+            "imageDigest": "sha256:999f8ab690bdb9135fa3786cd1734beffe5b7b642a5ffc7023b9554dfb2df75a",
+            "imageTags": [
+                "latest"
+            ],
+            "imageSizeInBytes": 1338,
+            "imagePushedAt": "2025-12-11T19:41:40.598000+00:00",
+            "imageManifestMediaType": "application/vnd.oci.image.manifest.v1+json",
+            "artifactMediaType": "application/vnd.oci.image.config.v1+json",
+            "imageStatus": "ACTIVE"
+        }
+    ]
+}

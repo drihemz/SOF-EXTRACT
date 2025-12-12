@@ -1,0 +1,150 @@
+{
+    "services": [
+        {
+            "serviceArn": "arn:aws:ecs:eu-north-1:516466084656:service/OCR/ocr-service-qu9kzscy",
+            "serviceName": "ocr-service-qu9kzscy",
+            "clusterArn": "arn:aws:ecs:eu-north-1:516466084656:cluster/OCR",
+            "loadBalancers": [
+                {
+                    "targetGroupArn": "arn:aws:elasticloadbalancing:eu-north-1:516466084656:targetgroup/sof/ae52d964728b8cb4",
+                    "containerName": "ocr",
+                    "containerPort": 8000
+                }
+            ],
+            "serviceRegistries": [],
+            "status": "ACTIVE",
+            "desiredCount": 1,
+            "runningCount": 0,
+            "pendingCount": 0,
+            "launchType": "FARGATE",
+            "platformVersion": "LATEST",
+            "platformFamily": "Linux",
+            "taskDefinition": "arn:aws:ecs:eu-north-1:516466084656:task-definition/ocr:3",
+            "deploymentConfiguration": {
+                "deploymentCircuitBreaker": {
+                    "enable": true,
+                    "rollback": true
+                },
+                "maximumPercent": 200,
+                "minimumHealthyPercent": 100,
+                "strategy": "ROLLING",
+                "bakeTimeInMinutes": 0
+            },
+            "deployments": [
+                {
+                    "id": "ecs-svc/9563726851205893904",
+                    "status": "PRIMARY",
+                    "taskDefinition": "arn:aws:ecs:eu-north-1:516466084656:task-definition/ocr:3",
+                    "desiredCount": 1,
+                    "pendingCount": 0,
+                    "runningCount": 0,
+                    "failedTasks": 3,
+                    "createdAt": "2025-12-12T01:46:38.498000+00:00",
+                    "updatedAt": "2025-12-12T01:58:28.193000+00:00",
+                    "launchType": "FARGATE",
+                    "platformVersion": "1.4.0",
+                    "platformFamily": "Linux",
+                    "networkConfiguration": {
+                        "awsvpcConfiguration": {
+                            "subnets": [
+                                "subnet-0a297c25f1fe3e612",
+                                "subnet-0a92611cdd9053273",
+                                "subnet-0779f8b1e02bc908d"
+                            ],
+                            "securityGroups": [
+                                "sg-0923c68c0c42bb5fb"
+                            ],
+                            "assignPublicIp": "ENABLED"
+                        }
+                    },
+                    "rolloutState": "FAILED",
+                    "rolloutStateReason": "ECS deployment circuit breaker: tasks failed to start."
+                }
+            ],
+            "roleArn": "arn:aws:iam::516466084656:role/aws-service-role/ecs.amazonaws.com/AWSServiceRoleForECS",
+            "events": [
+                {
+                    "id": "7b5bd467-efab-4f56-8218-c8c966eb8bbc",
+                    "createdAt": "2025-12-12T02:01:25.904000+00:00",
+                    "message": "(service ocr-service-qu9kzscy) was unable to place a task. Reason: ResourceInitializationError: unable to pull secrets or registry auth: The task cannot pull registry auth from Amazon ECR: There is a connection issue between the task and Amazon ECR. Check your task network configuration. operation error ECR: GetAuthorizationToken, exceeded maximum number of attempts, 3, https response error StatusCode: 0, RequestID: , request send failed, Post \"https://api.ecr.eu-north-1.amazonaws.com/\": dial tcp 13.53.180.123:443: i/o timeout."
+                },
+                {
+                    "id": "79a0bab9-1f12-4b04-94eb-c9809af83726",
+                    "createdAt": "2025-12-12T01:58:28.202000+00:00",
+                    "message": "(service ocr-service-qu9kzscy) (deployment ecs-svc/9563726851205893904) deployment failed: tasks failed to start."
+                },
+                {
+                    "id": "9a2f7d73-25bc-4757-8256-8b2eb863e74f",
+                    "createdAt": "2025-12-12T01:58:13.856000+00:00",
+                    "message": "(service ocr-service-qu9kzscy) has started 1 tasks: (task a1482adcc61540b2a681bd0eb21d2a9c)."
+                },
+                {
+                    "id": "98db3307-3ad3-46b1-bacb-242905775158",
+                    "createdAt": "2025-12-12T01:57:41.306000+00:00",
+                    "message": "(service ocr-service-qu9kzscy) was unable to place a task. Reason: ResourceInitializationError: unable to pull secrets or registry auth: The task cannot pull registry auth from Amazon ECR: There is a connection issue between the task and Amazon ECR. Check your task network configuration. operation error ECR: GetAuthorizationToken, exceeded maximum number of attempts, 3, https response error StatusCode: 0, RequestID: , request send failed, Post \"https://api.ecr.eu-north-1.amazonaws.com/\": dial tcp 13.53.180.149:443: i/o timeout."
+                },
+                {
+                    "id": "0cc82f9c-0205-4512-b3dc-d9edb7ba90ee",
+                    "createdAt": "2025-12-12T01:54:27.419000+00:00",
+                    "message": "(service ocr-service-qu9kzscy) has started 1 tasks: (task 0d3053256bc943dc8bd769b987fba1e1)."
+                },
+                {
+                    "id": "c1fb005f-3b35-42dc-a86c-dfaee9d5d559",
+                    "createdAt": "2025-12-12T01:53:56.900000+00:00",
+                    "message": "(service ocr-service-qu9kzscy) was unable to place a task. Reason: ResourceInitializationError: unable to pull secrets or registry auth: The task cannot pull registry auth from Amazon ECR: There is a connection issue between the task and Amazon ECR. Check your task network configuration. operation error ECR: GetAuthorizationToken, exceeded maximum number of attempts, 3, https response error StatusCode: 0, RequestID: , request send failed, Post \"https://api.ecr.eu-north-1.amazonaws.com/\": dial tcp 13.53.180.123:443: i/o timeout."
+                },
+                {
+                    "id": "252f4111-53d3-4e2d-b386-1ba2ac7027b9",
+                    "createdAt": "2025-12-12T01:50:53.150000+00:00",
+                    "message": "(service ocr-service-qu9kzscy) has started 1 tasks: (task 54d039b0fbd040178b51825dfcb8052a)."
+                },
+                {
+                    "id": "90181c2c-aa3a-4f0c-81cc-3fbcd0c1c8e5",
+                    "createdAt": "2025-12-12T01:50:22.482000+00:00",
+                    "message": "(service ocr-service-qu9kzscy) was unable to place a task. Reason: ResourceInitializationError: unable to pull secrets or registry auth: The task cannot pull registry auth from Amazon ECR: There is a connection issue between the task and Amazon ECR. Check your task network configuration. operation error ECR: GetAuthorizationToken, exceeded maximum number of attempts, 3, https response error StatusCode: 0, RequestID: , request send failed, Post \"https://api.ecr.eu-north-1.amazonaws.com/\": dial tcp 13.53.181.145:443: i/o timeout."
+                },
+                {
+                    "id": "7dd85d50-5696-4b4d-ba84-507b8ec16496",
+                    "createdAt": "2025-12-12T01:47:04.960000+00:00",
+                    "message": "(service ocr-service-qu9kzscy) has started 1 tasks: (task 7d0f05bda80e4306b4ff6c1b55f22ac4)."
+                }
+            ],
+            "createdAt": "2025-12-12T01:46:38.498000+00:00",
+            "currentServiceRevisions": [
+                {
+                    "arn": "arn:aws:ecs:eu-north-1:516466084656:service-revision/OCR/ocr-service-qu9kzscy/9563726851205893904",
+                    "requestedTaskCount": 1,
+                    "runningTaskCount": 0,
+                    "pendingTaskCount": 0
+                }
+            ],
+            "placementConstraints": [],
+            "placementStrategy": [],
+            "networkConfiguration": {
+                "awsvpcConfiguration": {
+                    "subnets": [
+                        "subnet-0a297c25f1fe3e612",
+                        "subnet-0a92611cdd9053273",
+                        "subnet-0779f8b1e02bc908d"
+                    ],
+                    "securityGroups": [
+                        "sg-0923c68c0c42bb5fb"
+                    ],
+                    "assignPublicIp": "ENABLED"
+                }
+            },
+            "healthCheckGracePeriodSeconds": 0,
+            "schedulingStrategy": "REPLICA",
+            "deploymentController": {
+                "type": "ECS"
+            },
+            "createdBy": "arn:aws:iam::516466084656:root",
+            "enableECSManagedTags": true,
+            "propagateTags": "NONE",
+            "enableExecuteCommand": false,
+            "availabilityZoneRebalancing": "ENABLED",
+            "resourceManagementType": "CUSTOMER"
+        }
+    ],
+    "failures": []
+}

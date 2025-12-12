@@ -6,6 +6,7 @@ from typing import Dict, List, Optional, Tuple
 
 import fitz  # PyMuPDF
 import numpy as np
+import boto3
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -23,8 +24,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.get("/health")
+@app.get("/")
+async def health():
+    return {"status": "ok"}
+
 TIME_REGEX = re.compile(r"(\d{1,2}[:h\.]\d{2})", re.IGNORECASE)
 DATE_REGEX = re.compile(r"(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})")
+HEADER_NOISE_WORDS = {
+    "port",
+    "of",
+    "santos",
+    "event",
+    "events",
+    "time",
+    "date",
+    "dates",
+    "flag",
+    "hold",
+    "wind",
+    "winds",
+    "bill",
+    "lading",
+}
 
 # Tunables via env for performance safeguards
 # Set SOF_MAX_PDF_PAGES=0 (default) to process all pages. Set a positive number to cap for performance if desired.
@@ -41,6 +64,9 @@ PADDLE_REC_THREADS = int(os.environ.get("SOF_PADDLE_THREADS", "4"))
 # Legacy placeholders for backward compatibility (not used with PaddleOCR)
 BASE_TESS_CONFIG = os.environ.get("SOF_TESS_CONFIG", "")
 DENSE_TESS_CONFIG = os.environ.get("SOF_TESS_CONFIG_DENSE", "")
+USE_TEXTRACT = os.environ.get("USE_TEXTRACT", "false").lower() in {"1", "true", "yes"}
+TEXTRACT_REGION = os.environ.get("TEXTRACT_REGION", os.environ.get("AWS_REGION", "eu-north-1"))
+TEXTRACT_MAX_SYNC_BYTES = 5 * 1024 * 1024  # Textract sync byte limit
 
 
 def _sanitize_time(val: Optional[str]) -> Optional[str]:
@@ -290,6 +316,59 @@ def _digit_ratio(text: str) -> float:
     return digits / float(len(text))
 
 
+def _find_invalid_time_tokens(text: str) -> List[str]:
+    """Return time-like tokens that fail HH:MM validation (e.g., 78:06, 59:68)."""
+    bad: List[str] = []
+    for raw in TIME_REGEX.findall(text):
+        normalized = raw.lower().replace("h", ":").replace(".", ":")
+        parts = normalized.split(":")
+        if len(parts) != 2:
+            continue
+        try:
+            h = int(parts[0])
+            m = int(parts[1])
+        except ValueError:
+            continue
+        if not (0 <= h <= 23 and 0 <= m <= 59):
+            bad.append(raw)
+    return bad
+
+
+def _filter_events(ev_batch: List[Dict]) -> List[Dict]:
+    """Drop obvious headers/noise and rows with impossible times; annotate warnings."""
+    filtered: List[Dict] = []
+    for ev in ev_batch:
+        text = (ev.get("event") or "").strip()
+        tokens = re.findall(r"[A-Za-z']+", text)
+        lower_tokens = [t.lower() for t in tokens]
+        has_time = bool(ev.get("start") or ev.get("end"))
+        has_date = bool(ev.get("dates"))
+        conf = ev.get("confidence") or 0.0
+
+        invalid_tokens = _find_invalid_time_tokens(text)
+        if invalid_tokens:
+            ev.setdefault("warnings", []).append(f"Invalid time(s): {', '.join(invalid_tokens)}")
+            # If the only time-like strings are invalid, drop the row entirely.
+            if not has_time and not has_date:
+                continue
+
+        # Require a valid time to keep the row (date-only or header-only lines are dropped).
+        if not has_time:
+            continue
+
+        # Hard gate: if no time/date, drop short/noisy headers and low-confidence single/dual tokens.
+        if not has_time and not has_date:
+            if len(tokens) <= 2:
+                if all(t in HEADER_NOISE_WORDS for t in lower_tokens):
+                    continue
+                if conf < 0.85:
+                    continue
+            if not tokens:
+                continue
+        filtered.append(ev)
+    return filtered
+
+
 def dedupe_events(events: List[Dict]) -> List[Dict]:
     seen = set()
     out: List[Dict] = []
@@ -307,6 +386,81 @@ OCR_ENGINE = PaddleOCR(
     use_angle_cls=True,
     lang=PADDLE_LANG,
 )
+
+_textract_client = None
+
+
+def get_textract_client():
+    global _textract_client
+    if _textract_client is None:
+        _textract_client = boto3.client("textract", region_name=TEXTRACT_REGION)
+    return _textract_client
+
+
+def textract_ocr(content: bytes):
+    """Use Amazon Textract detect_document_text to extract lines with bbox/conf/page."""
+    warnings: List[str] = []
+    if len(content) > TEXTRACT_MAX_SYNC_BYTES:
+        raise HTTPException(status_code=413, detail="File too large for Textract sync (5MB limit).")
+    client = get_textract_client()
+    try:
+        resp = client.detect_document_text(Document={"Bytes": content})
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Textract error: {e}") from e
+
+    blocks = resp.get("Blocks", [])
+    events: List[Dict] = []
+    boxes: List[Dict] = []
+    line_counters: Dict[int, int] = {}
+    for b in blocks:
+        if b.get("BlockType") != "LINE":
+            continue
+        text = (b.get("Text") or "").strip()
+        if not text:
+            continue
+        page = b.get("Page", 1)
+        line_counters[page] = line_counters.get(page, 0) + 1
+        line_no = line_counters[page]
+        conf = float(b.get("Confidence", 0.0)) / 100.0
+        geom = b.get("Geometry", {}).get("BoundingBox", {}) or {}
+        # Textract bbox is relative 0-1; keep as-is but scale to 1000 for numeric width/height
+        x = geom.get("Left", 0) * 1000
+        y = geom.get("Top", 0) * 1000
+        w = geom.get("Width", 0) * 1000
+        h = geom.get("Height", 0) * 1000
+        bbox = {"x": x, "y": y, "width": w, "height": h}
+
+        times, dates = extract_times_and_dates(text)
+        start = times[0] if len(times) >= 1 else None
+        end = times[1] if len(times) >= 2 else None
+
+        events.append(
+            {
+                "event": text,
+                "start": start,
+                "end": end,
+                "dates": list(dict.fromkeys(dates)),
+                "ratePercent": None,
+                "behavior": None,
+                "notes": text,
+                "page": page,
+                "line": line_no,
+                "confidence": conf,
+                "bbox": bbox,
+            }
+        )
+        boxes.append(
+            {
+                "page": page,
+                "line": line_no,
+                "text": text,
+                "bbox": bbox,
+                "confidence": conf,
+            }
+        )
+
+    page_count = resp.get("DocumentMetadata", {}).get("Pages", 0) or max(line_counters.keys() or [0])
+    return events, boxes, warnings, page_count
 
 
 def ocr_pdf_in_batches(content: bytes, max_pages: int, tess_cfg: str, dense_cfg: str, time_budget: int):
@@ -379,6 +533,7 @@ def ocr_pdf_in_batches(content: bytes, max_pages: int, tess_cfg: str, dense_cfg:
                 continue
             filtered_events.append(ev)
         ev_batch = filtered_events
+        ev_batch = _filter_events(ev_batch)
 
         events.extend(ev_batch)
         boxes.extend(box_batch)
@@ -388,7 +543,9 @@ def ocr_pdf_in_batches(content: bytes, max_pages: int, tess_cfg: str, dense_cfg:
                 f"Page {page_idx + 1} processing reached per-page time budget ({PER_PAGE_SECONDS}s); OCR result kept, no extra work attempted."
             )
 
-    events = dedupe_events(events)
+    events = _filter_events(dedupe_events(events))
+    keep_keys = {(e.get("page"), e.get("line"), e.get("event")) for e in events}
+    boxes = [b for b in boxes if (b.get("page"), b.get("line"), b.get("text")) in keep_keys]
     return events, boxes, warnings, total_pages
 
 
@@ -409,11 +566,14 @@ async def extract(file: UploadFile = File(...)):
 
     # Branch: PDFs use batch OCR; images use single-pass OCR
     if is_pdf:
-        events, boxes, ocr_warnings, page_count = ocr_pdf_in_batches(
-            content,
-            max_pages=MAX_PDF_PAGES if MAX_PDF_PAGES > 0 else 0,
-            tess_cfg=BASE_TESS_CONFIG,
-            dense_cfg=DENSE_TESS_CONFIG,
+        if USE_TEXTRACT:
+            events, boxes, ocr_warnings, page_count = textract_ocr(content)
+        else:
+            events, boxes, ocr_warnings, page_count = ocr_pdf_in_batches(
+                content,
+                max_pages=MAX_PDF_PAGES if MAX_PDF_PAGES > 0 else 0,
+                tess_cfg=BASE_TESS_CONFIG,
+                dense_cfg=DENSE_TESS_CONFIG,
             time_budget=MAX_SECONDS,
         )
     else:
